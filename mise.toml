@@ -1,3 +1,4 @@
 [tools]
+aws = { version = "latest", symlink_bins = "true" }
 node = "latest"
 terraform = "latest"
