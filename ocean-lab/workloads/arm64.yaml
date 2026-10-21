@@ -1,0 +1,26 @@
+# Runs only on arm64 nodes (scenario 04).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arm64
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: arm64
+  template:
+    metadata:
+      labels:
+        app: arm64
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        ocean-lab/vng: arm64
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi

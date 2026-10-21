@@ -96,6 +96,7 @@ variable "vngs" {
     labels                   = optional(map(string), {})
     taints                   = optional(list(object({ key = string, value = string, effect = string })))
     spot_percentage          = optional(number)
+    availability_vs_cost     = optional(string)
     min_instance_count       = optional(number)
     max_instance_count       = optional(number)
     auto_headroom_percentage = optional(number)

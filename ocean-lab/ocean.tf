@@ -83,6 +83,7 @@ module "vng" {
   taints = each.value.taints
 
   spot_percentage          = coalesce(each.value.spot_percentage, var.ocean.spot_percentage)
+  availability_vs_cost     = coalesce(each.value.availability_vs_cost, var.ocean.availability_vs_cost)
   min_instance_count       = each.value.min_instance_count
   max_instance_count       = each.value.max_instance_count
   auto_headroom_percentage = each.value.auto_headroom_percentage
