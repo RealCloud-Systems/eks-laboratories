@@ -1,5 +1,5 @@
 # Placeholder pods that only reserve capacity. Scale replicas to make Ocean add or remove nodes.
-# The affinity keeps them off the managed node group, so only Ocean nodes can host them.
+# The selector keeps them on the general VNG, off the managed node group and the other VNGs.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,13 +14,8 @@ spec:
       labels:
         app: inflate
     spec:
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: ocean-lab/vng
-                    operator: Exists
+      nodeSelector:
+        ocean-lab/vng: general
       terminationGracePeriodSeconds: 0
       containers:
         - name: pause

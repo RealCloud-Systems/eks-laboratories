@@ -1,0 +1,35 @@
+# Runs only on the On-Demand critical VNG (scenario 03), protected by a PDB.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: critical
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: critical
+  template:
+    metadata:
+      labels:
+        app: critical
+    spec:
+      nodeSelector:
+        ocean-lab/vng: critical
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: critical
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: critical
