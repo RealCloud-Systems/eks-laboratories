@@ -1,4 +1,7 @@
 [tools]
 aws = { version = "latest", symlink_bins = "true" }
+"github:awslabs/eks-node-viewer" = { version = "latest", bin = "eks-node-viewer" }
+helm = "latest"
+kubectl = "latest"
 node = "latest"
 terraform = "latest"

@@ -11,6 +11,14 @@ module "eks" {
   endpoint_public_access                   = true
   enable_cluster_creator_admin_permissions = true
 
+  # Lets nodes launched by Ocean join the cluster
+  access_entries = {
+    ocean_nodes = {
+      principal_arn = module.ocean_node_role.arn
+      type          = "EC2_LINUX"
+    }
+  }
+
   addons = {
     coredns                = {}
     kube-proxy             = {}

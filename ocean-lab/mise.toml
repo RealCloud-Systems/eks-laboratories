@@ -1,0 +1,3 @@
+# Loads the Spot credentials (TF_VAR_spotinst_token, TF_VAR_spotinst_account) from a local, untracked file
+[env]
+_.file = ".env"
