@@ -17,6 +17,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/), e os
 | 05 | [Explorando o Scale Down](#explorando-o-scale-down) | [05-scale-down.tfvars](./scenarios/05-scale-down.tfvars) | Scale down agressivo, `draining_timeout` e proteção com `restrict-scale-down` |
 | 06 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [06-spot-interruption.tfvars](./scenarios/06-spot-interruption.tfvars) | Interrupção de nodes Spot com o AWS FIS e a substituição pelo Ocean |
 | 07 | [Explorando o Roll](#explorando-o-roll) | [07-roll.tfvars](./scenarios/07-roll.tfvars) | Roll do cluster: troca dos nodes existentes em lotes após uma mudança de configuração |
+| 08 | [Explorando Scheduling: Shutdown hours](#explorando-scheduling-shutdown-hours) | [08-scheduling.tfvars](./scenarios/08-scheduling.tfvars) | Janelas de shutdown do cluster e tarefas agendadas (Roll com cron) |
 
 Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
@@ -683,3 +684,83 @@ aws ec2 describe-volumes \
 
 Durante um Roll existem nodes antigos e novos ao mesmo tempo, e por isso o custo sobe temporariamente. Em troca, as mudanças chegam a todo o cluster sem intervenção manual e sem janelas de manutenção. Em produção, mantenha o `respect_pdb` ligado e use lotes pequenos para os workloads que não toleram muitas trocas de uma vez.
 
+### Explorando Scheduling: Shutdown hours
+
+Ambientes de desenvolvimento e testes raramente precisam ficar ligados 24 horas por dia. O Ocean permite **agendar o desligamento do cluster** em janelas de horário, e também **agendar tarefas** como um Roll, sem depender de scripts ou de automações externas.
+
+#### Como funciona
+
+##### Shutdown hours
+
+Dentro de uma janela de shutdown, o Ocean **remove todos os nodes** que ele gerencia. Os pods que estavam neles ficam `Pending`, e quando a janela termina o Ocean sobe novamente os nodes necessários para agendá-los. O Controller continua rodando no Managed Node Group, por isso o cluster segue conectado à Spot.
+
+Algumas regras da configuração:
+
+- Os horários são sempre em **UTC**.
+- Cada janela usa o formato `Dia:HH:MM-Dia:HH:MM`, e precisa ser definida em **múltiplos de 30 minutos** (por exemplo `Mon:08:00-Mon:09:30`). Uma janela como `Thu:18:36-Thu:18:51` é recusada pela API com o erro `must be defined in multiples of 30 minutes`.
+- É possível definir várias janelas em `time_windows`, e uma janela pode atravessar a virada do dia (por exemplo `Fri:20:00-Mon:06:00`, para desligar o cluster no fim de semana).
+
+##### Tarefas agendadas
+
+O campo `tasks` agenda ações no cluster com uma expressão **cron** (também em UTC). O cenário usa a tarefa `clusterRoll`, que executa um Roll no horário definido, com os mesmos parâmetros que vimos no cenário anterior (`batch_size_percentage` e `respect_pdb`). Assim, a troca dos nodes para pegar novas AMIs ou configurações pode acontecer em um horário de baixo movimento.
+
+O arquivo [08-scheduling.tfvars](./scenarios/08-scheduling.tfvars) configura:
+
+```hcl
+ocean = {
+  shutdown_hours = {
+    is_enabled   = true
+    time_windows = ["Thu:18:30-Thu:23:00"] # UTC, múltiplos de 30 minutos
+  }
+  tasks = [{
+    is_enabled      = true
+    cron_expression = "8 19 * * *" # todos os dias às 19:08 UTC
+    task_type       = "clusterRoll"
+    parameters_cluster_roll = [{
+      batch_size_percentage = 50
+      respect_pdb           = true
+      comment               = "ocean-lab scheduled roll"
+    }]
+  }]
+}
+```
+
+> **Atenção:** os horários do arquivo são só um exemplo. Para ver o resultado, **edite a janela e o cron** para horários poucos minutos à frente do horário atual em UTC (`date -u`). A janela precisa começar em um horário de 30 em 30 minutos, então o tempo de espera pode chegar a 30 minutos.
+
+#### Preparação
+
+Escolha os horários, e mantenha alguns pods rodando para ver o que acontece com eles durante a janela:
+
+```bash
+date -u
+kubectl scale deploy/inflate --replicas=3
+terraform plan -out plan -var-file=scenarios/08-scheduling.tfvars
+terraform apply plan
+```
+
+#### Validação
+
+1. **Configuração**: no console da Spot, o modal **Customize Scaling** mostra uma grade semanal, com os períodos em que o cluster fica ligado (`Running`) e desligado (`Shutdown`), as horas de cada tipo por semana e uma estimativa da economia semanal.
+
+   ![Modal Cluster Shutdown Hours com a janela de shutdown na grade semanal](./images/shutdown.png)
+
+   > Cada coluna da grade representa 1 hora, então uma janela de 30 minutos ocupa meia coluna. Na imagem, o único bloco cinza é a janela de 30 minutos do exemplo, e os totais (167.5 horas ligado e 0.5 hora desligado por semana) batem com ela.
+
+   > Atenção ao fuso horário: a grade é mostrada no **horário local** do seu navegador, enquanto o Terraform e a API da Spot usam **UTC**. Por exemplo, uma janela `Thu:18:30-Thu:19:00` aparece na quinta-feira às 15:30 em um navegador no fuso GMT-3. A grade também mostra que a janela se repete **toda semana**. Os horários exatos em UTC podem ser conferidos no JSON da configuração do cluster (modal com a configuração do recurso).
+
+2. **Shutdown**: quando a janela começa, acompanhe os nodes e os pods:
+
+   ```bash
+   kubectl get nodes -l ocean-lab/vng -w
+   kubectl get pods -l app=inflate
+   ```
+
+   Os nodes do Ocean são removidos e os pods ficam `Pending`.
+
+3. **Retorno**: ao fim da janela, o Ocean sobe novos nodes e os pods voltam a rodar.
+
+4. **Tarefa agendada**: no horário do cron, a aba **Rolls** do cluster mostra um novo Roll, com o comentário configurado.
+
+#### Custo x Benefício
+
+Desligar o cluster fora do horário de uso é uma das formas mais simples de reduzir o custo de ambientes de desenvolvimento: durante a janela você não paga por nenhum node do Ocean. Em compensação, nada roda enquanto a janela estiver ativa, e os pods levam alguns minutos para voltar quando ela termina. Não use em ambientes que atendam usuários ou jobs fora do horário configurado.
