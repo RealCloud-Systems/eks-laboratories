@@ -15,6 +15,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/), e os
 | 03 | [Explorando os Virtual Node Groups](#explorando-os-virtual-node-groups) | [03-vngs.tfvars](./scenarios/03-vngs.tfvars) | Isolamento de workloads com labels, taints e On-Demand |
 | 04 | [Explorando tipos de instâncias](#explorando-tipos-de-instâncias) | [04-instances.tfvars](./scenarios/04-instances.tfvars) | Filtros de instâncias, `availability_vs_cost` e ARM (Graviton) |
 | 05 | [Explorando o Scale Down](#explorando-o-scale-down) | [05-scale-down.tfvars](./scenarios/05-scale-down.tfvars) | Scale down agressivo, `draining_timeout` e proteção com `restrict-scale-down` |
+| 06 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [06-spot-interruption.tfvars](./scenarios/06-spot-interruption.tfvars) | Interrupção de nodes Spot com o AWS FIS e a substituição pelo Ocean |
 
 Um cenário é aplicado com:
 
@@ -507,4 +508,81 @@ Todo esse fluxo pode ser acompanhado na aba **Log** do cluster no console da Spo
 #### Custo x Benefício
 
 Um scale down mais rápido reduz o tempo em que você paga por nodes ociosos, mas deixa menos folga para o cluster: se a carga voltar logo em seguida, o Ocean precisa subir nodes novamente. Combine com o headroom do cenário anterior quando o seu workload for sensível a essa oscilação, e use o `restrict-scale-down` somente nos workloads que não toleram ser movidos (por exemplo, jobs de longa duração).
+
+### Explorando as interrupções das máquinas Spot
+
+A principal diferença entre Spot e On-Demand é que a AWS pode **retomar a instância** a qualquer momento, avisando com apenas 2 minutos de antecedência. Neste cenário vamos provocar essa interrupção de propósito e ver como o Ocean reage.
+
+#### Como funciona
+
+Quando a AWS decide retomar uma instância Spot, ela envia um aviso de interrupção de 2 minutos para a instância. O Ocean monitora esses avisos e, ao receber um, não espera o node sumir: ele **retira a instância do VNG** (o node fica `SchedulingDisabled`) e **repõe a capacidade** com um node substituto, para que o cluster já tenha um novo node pronto quando a instância for encerrada. Neste laboratório, o substituto sobe porque o VNG fica abaixo do `min_instance_count`; em um cluster com workloads, o Ocean também sobe nodes para os pods que precisarem sair do node interrompido.
+
+Esperar uma interrupção real para testar isso não é viável, então usamos o **AWS Fault Injection Service (FIS)**, serviço da AWS para testes de caos. A ação `aws:ec2:send-spot-instance-interruptions` envia para uma instância Spot o mesmo aviso que a AWS enviaria em uma interrupção real, e o Ocean reage da mesma forma.
+
+O arquivo [06-spot-interruption.tfvars](./scenarios/06-spot-interruption.tfvars) configura:
+
+```hcl
+vngs = {
+  general = {
+    min_instance_count = 2 # sempre 2 nodes Spot ligados
+  }
+}
+
+fis = {
+  enabled = true # cria a role e o experimento do FIS
+}
+```
+
+- **`min_instance_count = 2`**: o VNG mantém sempre 2 nodes ligados, mesmo sem pods. Assim existe algo para interromper sem precisar de workloads.
+- **`fis.enabled`**: cria, em [fis.tf](./fis.tf), uma role para o FIS e um *experiment template*, que fica desligado por padrão para que os outros cenários não criem esses recursos. A role só tem permissão para enviar avisos de interrupção, e o template seleciona **somente uma** instância (`COUNT(1)`) com a tag que o Ocean coloca em todos os nodes que lança (`spotinst:aws:ec2:group:name`). Os nodes do Managed Node Group não são afetados.
+
+> O aviso de interrupção é enviado com 2 minutos de antecedência (`notice_duration`), o mínimo aceito pelo FIS, que é o mesmo prazo de uma interrupção real da AWS.
+
+#### Preparação
+
+Aplique o cenário e aguarde os 2 nodes ficarem `Ready`:
+
+```bash
+terraform plan -out plan -var-file=scenarios/06-spot-interruption.tfvars
+terraform apply plan
+kubectl get nodes -l ocean-lab/vng=general -L node.kubernetes.io/instance-type,spotinst.io/node-lifecycle
+```
+
+#### Validação
+
+1. **Inicie o experimento** com o ID do template, que está no output do terraform:
+
+   ```bash
+   aws fis start-experiment --experiment-template-id $(terraform output -raw fis_experiment_template_id)
+   ```
+
+   O experimento passa de `initiating` para `running` e termina sozinho, já que a ação só envia o aviso. Para acompanhar o status:
+
+   ```bash
+   aws fis get-experiment --id <id do experimento> --query experiment.state.status
+   ```
+
+2. **Acompanhe os nodes**: em outro terminal, observe o que o Ocean faz durante os 2 minutos do aviso.
+
+   ```bash
+   kubectl get nodes -l ocean-lab/vng=general -L node.kubernetes.io/instance-type -w
+   ```
+
+   A sequência esperada é:
+
+   1. Segundos após o experimento iniciar, o node interrompido é marcado como `SchedulingDisabled`: o Ocean impede que novos pods sejam agendados nele.
+   2. Menos de 1 minuto depois do aviso, um **node substituto** aparece em `NotReady` e logo em seguida `Ready`.
+   3. Ao final dos 2 minutos, a instância é retomada pela AWS: o node interrompido passa para `NotReady` e some da lista.
+
+   O substituto fica pronto **antes** do node ser retomado, e o VNG continua com os 2 nodes do `min_instance_count`. O tipo de instância do substituto pode ser diferente do original.
+
+3. **Confira no console**: a aba **Log** do cluster no console da Spot registra os eventos do cluster durante o experimento.
+
+   ![Eventos da interrupção e da reposição do node na aba Log](./images/spot_interruption.png)
+
+   > Lendo de baixo para cima: o Ocean retira a instância interrompida do VNG com o motivo `Detach instances due to interruption` e, na sequência, lança o substituto porque o VNG `general` ficou abaixo do número mínimo de instâncias. O evento `have been terminated` da instância original é registrado depois, e pode aparecer cerca de 1 minuto após o node já ter sumido do `kubectl`. Os avisos `Can't scale down nodes ... have reached the minimum capacity` não são erros: o Ocean tenta remover nodes sem uso, mas o `min_instance_count` do VNG impede. Os IDs das instâncias e o fuso horário serão os do seu ambiente.
+
+#### Custo x Benefício
+
+O Spot só é vantajoso para workloads que toleram ser movidos. O Ocean reduz o impacto das interrupções, porque repõe a capacidade antes de o node ser retomado, mas **não evita** que os pods que estavam nele sejam reiniciados. Para workloads que não toleram isso, use um VNG com `spot_percentage = 0`, como o `critical` do cenário de VNGs, ou garanta mais de uma réplica com um PodDisruptionBudget.
 

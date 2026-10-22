@@ -15,3 +15,5 @@ data "aws_ssm_parameter" "ami" {
 
   name = "/aws/service/eks/optimized-ami/${local.cluster.version}/amazon-linux-2023/${each.key}/standard/recommended/image_id"
 }
+
+data "aws_caller_identity" "current" {}

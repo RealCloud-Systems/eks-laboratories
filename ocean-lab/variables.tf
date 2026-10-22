@@ -121,3 +121,13 @@ variable "controller" {
   })
   default = {}
 }
+
+variable "fis" {
+  description = "AWS FIS experiment that sends a Spot interruption notice to the Ocean nodes."
+  type = object({
+    enabled = optional(bool, false)
+    # How long before the interruption the notice is sent (ISO 8601), AWS requires at least 2 minutes
+    notice_duration = optional(string, "PT2M")
+  })
+  default = {}
+}
