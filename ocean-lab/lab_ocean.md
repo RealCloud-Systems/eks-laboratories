@@ -16,11 +16,13 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/), e os
 | 04 | [Explorando tipos de instâncias](#explorando-tipos-de-instâncias) | [04-instances.tfvars](./scenarios/04-instances.tfvars) | Filtros de instâncias, `availability_vs_cost` e ARM (Graviton) |
 | 05 | [Explorando o Scale Down](#explorando-o-scale-down) | [05-scale-down.tfvars](./scenarios/05-scale-down.tfvars) | Scale down agressivo, `draining_timeout` e proteção com `restrict-scale-down` |
 | 06 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [06-spot-interruption.tfvars](./scenarios/06-spot-interruption.tfvars) | Interrupção de nodes Spot com o AWS FIS e a substituição pelo Ocean |
+| 07 | [Explorando o Roll](#explorando-o-roll) | [07-roll.tfvars](./scenarios/07-roll.tfvars) | Roll do cluster: troca dos nodes existentes em lotes após uma mudança de configuração |
 
-Um cenário é aplicado com:
+Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
 ```bash
-terraform apply -var-file=scenarios/<cenário>.tfvars
+terraform plan -out plan -var-file=scenarios/<cenário>.tfvars
+terraform apply plan
 ```
 
 > Os cenários **não são cumulativos**: cada arquivo altera somente alguns valores, e tudo o que ele não define volta para o padrão do [variables.tf](./variables.tf). Por exemplo, ao aplicar o cenário 03 o headroom manual do cenário 02 é removido.
@@ -43,7 +45,7 @@ O Ocean Lab lê os dados do cluster (endpoint, subnets, security groups, instanc
 
 Copie o arquivo [.env.example](./.env.example) para `.env` e preencha as variáveis com os valores do próximo passo. O `.env` é carregado automaticamente pelo mise e não deve ser commitado.
 
-Caso não queira usar o arquivo `.env` você pode configurar as variáveis em um arquivo **env.tfvars** e passar esse arquivo para os comandos `terraform plan` e `terraform apply` com `-var-file=env.tfvars`.
+Caso não queira usar o arquivo `.env` você pode configurar as variáveis em um arquivo **env.tfvars** e passar esse arquivo para o comando `terraform plan` com `-var-file=env.tfvars`.
 
 ### Criar o Token e Buscar o ID da Conta
 
@@ -83,7 +85,8 @@ Com as configurações acima feitas, agora execute o terraform plan e apply dest
 
 ```bash
 terraform init
-terraform apply -var-file=scenarios/01-baseline.tfvars
+terraform plan -out plan -var-file=scenarios/01-baseline.tfvars
+terraform apply plan
 ```
 
 Vamos primeiro fazer uma revisão dos conceitos relativos ao Ocean para então validar a nossa infraestrutura.
@@ -208,7 +211,8 @@ Antes de aplicar, volte o `inflate` para 0 réplicas, e aplique o cenário:
 
 ```bash
 kubectl scale deploy/inflate --replicas=0
-terraform apply -var-file=scenarios/02-headroom.tfvars
+terraform plan -out plan -var-file=scenarios/02-headroom.tfvars
+terraform apply plan
 ```
 
 #### Validação
@@ -304,7 +308,8 @@ Confira aqui os 3 deployments: [Critical](./workloads/critical.yaml) | [Batch](.
 Aplique o cenário e os workloads:
 
 ```bash
-terraform apply -var-file=scenarios/03-vngs.tfvars
+terraform plan -out plan -var-file=scenarios/03-vngs.tfvars
+terraform apply plan
 kubectl apply -f workloads/batch.yaml -f workloads/critical.yaml
 ```
 
@@ -383,7 +388,8 @@ kubectl delete -f workloads/batch.yaml -f workloads/critical.yaml
 Aplique o cenário:
 
 ```bash
-terraform apply -var-file=scenarios/04-instances.tfvars
+terraform plan -out plan -var-file=scenarios/04-instances.tfvars
+terraform apply plan
 ```
 
 #### Validação
@@ -466,7 +472,8 @@ Além das configurações do cluster, é possível **proteger um node** do scale
 Para poder comparar, o ideal é ter mais de um node no VNG `general`. Aplique o cenário, faça o deploy do pod protegido e escale o `inflate` para 8 réplicas:
 
 ```bash
-terraform apply -var-file=scenarios/05-scale-down.tfvars
+terraform plan -out plan -var-file=scenarios/05-scale-down.tfvars
+terraform apply plan
 kubectl apply -f workloads/restrict-scale-down.yaml
 kubectl scale deploy/inflate --replicas=8
 kubectl get nodes -l ocean-lab/vng=general -L node.kubernetes.io/instance-type,spotinst.io/node-lifecycle
@@ -585,4 +592,94 @@ kubectl get nodes -l ocean-lab/vng=general -L node.kubernetes.io/instance-type,s
 #### Custo x Benefício
 
 O Spot só é vantajoso para workloads que toleram ser movidos. O Ocean reduz o impacto das interrupções, porque repõe a capacidade antes de o node ser retomado, mas **não evita** que os pods que estavam nele sejam reiniciados. Para workloads que não toleram isso, use um VNG com `spot_percentage = 0`, como o `critical` do cenário de VNGs, ou garanta mais de uma réplica com um PodDisruptionBudget.
+
+### Explorando o Roll - Atualização em lote de nodes
+
+Nos cenários anteriores, vimos que alterações de configuração, como os filtros de instâncias, valem somente para **novos nodes**, e os nodes que já existiam continuam rodando como estavam. Neste cenário vamos ver como o Ocean substitui os nodes existentes por nodes com a nova configuração: o **Roll**.
+
+#### Como funciona
+
+Um Roll troca os nodes de um cluster **em lotes**: o Ocean sobe nodes novos com a configuração atual, drena os pods dos nodes antigos para os novos e encerra os antigos. Ele é usado quando uma mudança precisa chegar aos nodes que já estão rodando, como uma nova AMI, o tamanho do volume raiz ou os filtros de instâncias.
+
+Os parâmetros do Roll, no bloco `ocean`:
+
+- **`should_roll`**: quando `true`, o Ocean inicia um Roll ao aplicar uma mudança de configuração que exige a troca dos nodes. Por padrão está desligado, e as mudanças valem somente para os novos nodes.
+- **`batch_size_percentage`**: o percentual de nodes que é trocado de cada vez. Um valor menor deixa o Roll mais lento e mais seguro. Um valor maior termina mais rápido, mas troca mais nodes ao mesmo tempo.
+- **`respect_pdb`**: se `true`, o Ocean respeita os PodDisruptionBudgets ao drenar os nodes.
+- **`batch_min_healthy_percentage`**: o percentual mínimo de nodes de um lote que precisa estar saudável para que o Roll siga para o próximo lote.
+- **`conditioned_roll`**: troca somente os nodes que estão diferentes da configuração atual.
+
+O arquivo [07-roll.tfvars](./scenarios/07-roll.tfvars) configura:
+
+```hcl
+ocean = {
+  should_roll           = true
+  root_volume_size      = 40 # era 30 GiB: mudança que só vale para novos nodes
+  batch_size_percentage = 50 # metade dos nodes por lote
+}
+```
+
+Aumentar o volume raiz é uma mudança simples de validar, já que o tamanho do disco de cada instância pode ser conferido na AWS.
+
+> O módulo de VNG também precisa do `root_volume_size`. O laboratório repassa o valor do cluster para os VNGs, assim o disco novo vale para todos os nodes.
+
+> Como os cenários não são cumulativos, aplicar o 07 também desliga o `fis` do cenário anterior: a role e o experimento do FIS são removidos.
+
+##### Roll no cluster ou em um VNG
+
+O Roll pode ser feito em dois níveis:
+
+- **No cluster**: troca os nodes de **todos** os VNGs. É o que este cenário faz, com o `should_roll` configurado no bloco `ocean`.
+- **Em um VNG**: o VNG também tem as suas configurações de Roll (`update_policy`), e a troca vale somente para os nodes daquele VNG.
+
+Em produção, é comum ter VNGs com perfis bem diferentes, como um VNG `critical` somente On-Demand e outros VNGs de batch ou ARM. Uma mudança feita no nível do cluster e aplicada com o Roll do cluster atinge todos eles ao mesmo tempo, **inclusive os workloads mais sensíveis**, e por isso é mais arriscada. Uma estratégia mais segura é:
+
+1. Fazer o Roll primeiro em um VNG de menor risco, como o de batch, e validar a nova configuração.
+2. Seguir para os demais VNGs, deixando o `critical` por último.
+3. Usar lotes pequenos (`batch_size_percentage`) e manter o `respect_pdb` ligado nos VNGs mais sensíveis.
+
+> Este cenário exercita somente o Roll do cluster. O Roll por VNG não é explorado aqui, mas a lógica é a mesma, com o escopo reduzido aos nodes do VNG.
+
+#### Preparação
+
+Antes do Roll, coloque alguns pods para rodar, para ver o que acontece com eles durante a troca. Escale o `inflate` e confira quantos nodes existem e o tamanho do volume raiz de cada um:
+
+```bash
+kubectl scale deploy/inflate --replicas=3
+kubectl get nodes -l ocean-lab/vng=general -L node.kubernetes.io/instance-type
+
+aws ec2 describe-volumes \
+  --filters "Name=tag-key,Values=spotinst:aws:ec2:group:createdBy" \
+  --query "Volumes[].[Attachments[0].InstanceId,Size]" --output text
+```
+
+#### Validação
+
+1. **Gere o plano e aplique o cenário**: o Roll começa junto com o apply.
+
+   ```bash
+   terraform plan -out plan -var-file=scenarios/07-roll.tfvars
+   terraform apply plan
+   ```
+
+2. **Acompanhe o Roll no console**: na aba **Rolls** do cluster, o Roll aparece com o número de lotes e o status de cada um. Com 3 nodes e `batch_size_percentage = 50`, são 2 lotes.
+
+   ![Roll em andamento na aba Rolls do console](./images/roll.png)
+
+   > A tela mostra o ID do Roll, o **escopo** (`Cluster`, já que o `should_roll` foi configurado no cluster), o número de lotes e o progresso: nodes em andamento no lote atual, já substituídos e ainda por substituir. Na lista, cada node aparece com o seu VNG, o lote em que será trocado e o status. Com 3 nodes e lotes de 50%, o primeiro lote troca 2 nodes e o segundo, o node restante. O console também mostra uma estimativa de duração (por volta de 7 minutos por lote), que serve só como referência. Os IDs serão os do seu ambiente.
+
+3. **Acompanhe os nodes**: os nodes antigos são marcados como `SchedulingDisabled`, drenados e encerrados, e nodes novos entram no lugar. O Roll leva alguns minutos, e o tipo de instância dos nodes novos pode ser diferente dos antigos.
+
+   ```bash
+   kubectl get nodes -l ocean-lab/vng=general -L node.kubernetes.io/instance-type -w
+   kubectl get pods -l app=inflate -o wide -w
+   ```
+
+4. **Confira os pods**: os pods do `inflate` são **recriados** nos nodes novos, e não movidos: confira que a coluna `AGE` deles é menor que o tempo do Roll.
+
+5. **Confira o volume dos nodes novos**: ao final do Roll, repita o comando de volumes da preparação. Todos os nodes devem ter o novo tamanho (40 GiB) e o `Roll` aparece como `COMPLETED` na aba **Rolls**.
+
+#### Custo x Benefício
+
+Durante um Roll existem nodes antigos e novos ao mesmo tempo, e por isso o custo sobe temporariamente. Em troca, as mudanças chegam a todo o cluster sem intervenção manual e sem janelas de manutenção. Em produção, mantenha o `respect_pdb` ligado e use lotes pequenos para os workloads que não toleram muitas trocas de uma vez.
 
