@@ -1,0 +1,26 @@
+# The spotinst.io/restrict-scale-down label stops Ocean from removing the node this pod runs on (scenario 05).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: restricted
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: restricted
+  template:
+    metadata:
+      labels:
+        app: restricted
+        spotinst.io/restrict-scale-down: "true"
+    spec:
+      nodeSelector:
+        ocean-lab/vng: general
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi

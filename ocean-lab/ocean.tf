@@ -89,6 +89,10 @@ module "vng" {
   auto_headroom_percentage = each.value.auto_headroom_percentage
   restrict_scale_down      = each.value.restrict_scale_down
 
+  # The module sends false by default, which would override the cluster's value.
+  # max_scale_down_percentage stays null: Spot rejects it on both the cluster and the VNG.
+  is_aggressive_scale_down_enabled = coalesce(var.ocean.is_aggressive_scale_down_enabled, false)
+
   # The module defaults differ from the Ocean template, keep them aligned
   root_volume_size            = var.ocean.root_volume_size
   draining_timeout            = null # inherit from the cluster; on a VNG Spot requires >= 300

@@ -14,6 +14,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/), e os
 | 02 | [Explorando o Headroom](#explorando-o-headroom) | [02-headroom.tfvars](./scenarios/02-headroom.tfvars) | Headroom automático + manual |
 | 03 | [Explorando os Virtual Node Groups](#explorando-os-virtual-node-groups) | [03-vngs.tfvars](./scenarios/03-vngs.tfvars) | Isolamento de workloads com labels, taints e On-Demand |
 | 04 | [Explorando tipos de instâncias](#explorando-tipos-de-instâncias) | [04-instances.tfvars](./scenarios/04-instances.tfvars) | Filtros de instâncias, `availability_vs_cost` e ARM (Graviton) |
+| 05 | [Explorando o Scale Down](#explorando-o-scale-down) | [05-scale-down.tfvars](./scenarios/05-scale-down.tfvars) | Scale down agressivo, `draining_timeout` e proteção com `restrict-scale-down` |
 
 Um cenário é aplicado com:
 
@@ -423,3 +424,87 @@ Alguns pontos importantes:
   kubectl scale deploy/inflate --replicas=0
   kubectl delete -f workloads/arm64.yaml
   ```
+### Explorando o Scale Down
+
+Nos cenários anteriores vimos o Ocean subindo nodes. Neste vamos explorar o caminho inverso: **como e com que velocidade o Ocean remove nodes** que não são mais necessários, e como proteger um node dessa remoção.
+
+#### Como funciona
+
+O Ocean avalia continuamente a utilização dos nodes. Quando os pods de um node cabem em outros nodes do cluster, ele marca o node como candidato, drena os pods (respeitando os PodDisruptionBudgets) e então encerra a instância. Três configurações controlam esse processo:
+
+- **`is_aggressive_scale_down_enabled`**: liga o modo agressivo de scale down. Por padrão ele está desligado.
+- **`max_scale_down_percentage`**: o máximo de nodes, em percentual, que o Ocean remove em um mesmo ciclo. O padrão deste laboratório é 10%, o que em clusters pequenos significa remover um node por vez.
+- **`draining_timeout`**: o tempo que o Ocean espera a drenagem dos pods terminar antes de encerrar a instância, em segundos.
+
+O arquivo [05-scale-down.tfvars](./scenarios/05-scale-down.tfvars) configura:
+
+```hcl
+ocean = {
+  is_aggressive_scale_down_enabled = true
+  max_scale_down_percentage        = 50 # até metade dos nodes por ciclo
+  draining_timeout                 = 60 # segundos
+}
+```
+
+Além das configurações do cluster, é possível **proteger um node** do scale down: pods com o label `spotinst.io/restrict-scale-down: "true"` impedem que o Ocean remova o node em que estão rodando, mesmo que ele esteja vazio de outros pods. O mesmo pode ser feito para todos os nodes de um VNG com o campo `restrict_scale_down`. Veja o workload [restrict-scale-down](./workloads/restrict-scale-down.yaml):
+
+```yaml
+  template:
+    metadata:
+      labels:
+        app: restricted
+        spotinst.io/restrict-scale-down: "true"
+```
+
+> **Atenção:** o `max_scale_down_percentage` só pode ser definido no cluster ou no VNG, nunca nos dois ao mesmo tempo, como acontece com o `spot_percentage`. Já o `is_aggressive_scale_down_enabled` é enviado pelo módulo de VNG com o valor `false` como padrão, o que sobrescreve o valor do cluster. Por isso, o laboratório repassa o valor do cluster para todos os VNGs.
+
+> O `draining_timeout` de 60 segundos serve para o laboratório. Em produção, use um valor que dê tempo para os seus pods encerrarem as conexões e finalizarem o trabalho em andamento (o mínimo aceito em um VNG é 300 segundos).
+
+#### Preparação
+
+Para poder comparar, o ideal é ter mais de um node no VNG `general`. Aplique o cenário, faça o deploy do pod protegido e escale o `inflate` para 8 réplicas:
+
+```bash
+terraform apply -var-file=scenarios/05-scale-down.tfvars
+kubectl apply -f workloads/restrict-scale-down.yaml
+kubectl scale deploy/inflate --replicas=8
+kubectl get nodes -l ocean-lab/vng=general -L node.kubernetes.io/instance-type,spotinst.io/node-lifecycle
+```
+
+Serão criados 2 nodes. Confira em qual deles o pod `restricted` está rodando:
+
+```bash
+kubectl get pods -o wide
+```
+
+#### Validação
+
+1. **Scale down dos nodes sem proteção**: escale o `inflate` para 0 e acompanhe os nodes.
+
+   ```bash
+   kubectl scale deploy/inflate --replicas=0
+   kubectl get nodes -l ocean-lab/vng=general -w
+   ```
+
+   O Ocean primeiro espera alguns minutos para confirmar que o node está de fato ocioso, e só então o marca como `SchedulingDisabled` (cordon), drena e encerra a instância, que passa por `NotReady` até desaparecer da lista. No total leva alguns minutos a menos do que no baseline, onde o scale down com os valores padrão leva por volta de 10 a 12 minutos. O modo agressivo não remove o node imediatamente: ele reduz a espera, mas o Ocean ainda confirma que o node está ocioso antes de agir.
+
+2. **Node protegido**: o node em que o `restricted` está rodando **continua ligado**, mesmo sem nenhum outro pod, enquanto o outro node é removido.
+
+3. **Remoção da proteção**: apague o workload e o node protegido passa a ser removido normalmente.
+
+   ```bash
+   kubectl delete -f workloads/restrict-scale-down.yaml
+   ```
+
+   Como esse node já estava ocioso há alguns minutos, o Ocean não precisa esperar novamente: o cordon acontece em menos de um minuto e o node some da lista logo em seguida, em cerca de 3 minutos no total.
+
+Todo esse fluxo pode ser acompanhado na aba **Log** do cluster no console da Spot:
+
+![Eventos de scale up e de scale down na aba Log](./images/scale_down.png)
+
+> Lendo de baixo para cima: o scale up lança os 2 nodes para os pods pendentes (o evento mostra a soma de CPU e memória requisitada), depois o primeiro node é removido e, somente após a remoção do workload protegido, o segundo. Entre os dois scale downs não existe nenhum evento para o node protegido, já que o Ocean nunca o seleciona como candidato. Os IDs das instâncias serão os do seu ambiente.
+
+#### Custo x Benefício
+
+Um scale down mais rápido reduz o tempo em que você paga por nodes ociosos, mas deixa menos folga para o cluster: se a carga voltar logo em seguida, o Ocean precisa subir nodes novamente. Combine com o headroom do cenário anterior quando o seu workload for sensível a essa oscilação, e use o `restrict-scale-down` somente nos workloads que não toleram ser movidos (por exemplo, jobs de longa duração).
+
