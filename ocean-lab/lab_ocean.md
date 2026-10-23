@@ -45,7 +45,7 @@ mise install
 Este projeto depende da criação de um cluster EKS na AWS.
 Consulte o [README do eks-workshop](../eks-workshop/README.md), verifique as configurações no arquivo `locals.tf` e execute o terraform em seu ambiente.
 
-O Ocean Lab lê os dados do cluster (endpoint, subnets, security groups, instance profile dos nodes) a partir do state do eks-workshop, então ajuste o backend em [data.tf](./data.tf) e [versions.tf](./versions.tf) caso esteja usando outro bucket.
+O Ocean Lab lê os dados do cluster (endpoint, subnets, security groups, instance profile dos nodes) a partir do state do eks-workshop, então ajuste o bucket e o profile em [data.tf](./data.tf) e [versions.tf](./versions.tf), e o profile em [locals.tf](./locals.tf), caso esteja usando outro bucket ou outro profile.
 
 ### Arquivo env
 

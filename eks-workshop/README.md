@@ -27,6 +27,7 @@ Você precisa de um profile do AWS CLI com permissão para criar VPC, EKS, EC2 e
 
 - `locals.tf`: `profile` (e `region`, se não for usar `us-east-1`)
 - `versions.tf`: `profile` dentro do bloco `backend "s3"`
+- `../ocean-lab/locals.tf`, `../ocean-lab/data.tf` e `../ocean-lab/versions.tf`: o Ocean Lab usa o mesmo profile
 
 ### Bucket do state
 
@@ -66,9 +67,9 @@ Com os nodes do Managed Node Group em `Ready`, siga para o [Ocean Lab](../ocean-
 
 ## Custos e remoção
 
-O cluster EKS, o NAT Gateway e os nodes do Managed Node Group são cobrados enquanto estiverem ligados, mesmo sem workloads. Ao terminar, remova primeiro o Ocean Lab, para que o Ocean encerre os nodes que ele criou, e depois este projeto:
+O cluster EKS, o NAT Gateway e os nodes do Managed Node Group são cobrados enquanto estiverem ligados, mesmo sem workloads. Ao terminar, remova primeiro o Ocean Lab, seguindo a seção [Limpeza](../ocean-lab/lab_ocean.md#limpeza) do guia, para que o Ocean encerre os nodes que ele criou. Depois, remova este projeto:
 
 ```bash
-cd ../ocean-lab && terraform destroy
-cd ../eks-workshop && terraform destroy
+terraform plan -destroy -out plan
+terraform apply plan
 ```
