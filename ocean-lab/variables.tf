@@ -131,3 +131,21 @@ variable "fis" {
   })
   default = {}
 }
+
+variable "right_sizing" {
+  description = "Automatic right sizing: a rule that applies the recommendations to the workloads on a schedule."
+  type = object({
+    enabled    = optional(bool, false)
+    namespaces = optional(list(string), ["default"])
+    # MORE_THAN_ONE_REPLICA, ALL_MANIFEST, NO_RESTART or IN_PLACE_OR_RECREATE
+    restart_replicas = optional(string, "MORE_THAN_ONE_REPLICA")
+    # Weekly window in which the recommendations can be applied (HH:MM)
+    days       = optional(list(string), ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"])
+    start_time = optional(string, "00:00")
+    end_time   = optional(string, "23:59")
+    # Percentile used to calculate the recommendations, null keeps the Ocean default
+    cpu_percentile    = optional(number)
+    memory_percentile = optional(number)
+  })
+  default = {}
+}

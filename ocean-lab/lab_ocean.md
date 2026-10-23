@@ -18,6 +18,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/), e os
 | 06 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [06-spot-interruption.tfvars](./scenarios/06-spot-interruption.tfvars) | Interrupção de nodes Spot com o AWS FIS e a substituição pelo Ocean |
 | 07 | [Explorando o Roll](#explorando-o-roll) | [07-roll.tfvars](./scenarios/07-roll.tfvars) | Roll do cluster: troca dos nodes existentes em lotes após uma mudança de configuração |
 | 08 | [Explorando Scheduling: Shutdown hours](#explorando-scheduling-shutdown-hours) | [08-scheduling.tfvars](./scenarios/08-scheduling.tfvars) | Janelas de shutdown do cluster e tarefas agendadas (Roll com cron) |
+| 09 | [Explorando o Right Sizing](#explorando-o-right-sizing) | [09-rightsizing.tfvars](./scenarios/09-rightsizing.tfvars) | Right Sizing dos requests dos pods com o Controller e o Metrics Server |
 
 Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
@@ -764,3 +765,113 @@ terraform apply plan
 #### Custo x Benefício
 
 Desligar o cluster fora do horário de uso é uma das formas mais simples de reduzir o custo de ambientes de desenvolvimento: durante a janela você não paga por nenhum node do Ocean. Em compensação, nada roda enquanto a janela estiver ativa, e os pods levam alguns minutos para voltar quando ela termina. Não use em ambientes que atendam usuários ou jobs fora do horário configurado.
+
+### Explorando o Right Sizing
+
+Um dos desperdícios mais comuns em um cluster Kubernetes não está nos nodes, e sim nos **requests de CPU e memória dos pods**: o Kubernetes reserva o que o pod pede, e não o que ele usa. Se um pod pede 1 CPU e 2 GiB, mas usa uma fração disso, o resto fica reservado e o Ocean precisa de mais nodes (e você paga por eles) para acomodar essa reserva.
+
+O **Right Sizing** do Ocean compara o que os containers pedem com o que eles realmente consomem, e sugere valores de requests mais adequados.
+
+#### Como funciona
+
+O Ocean Controller coleta o consumo de CPU e memória dos containers e envia para a Spot, que calcula as sugestões. Para isso, o Controller precisa de duas coisas:
+
+- **Right Sizing habilitado**: o chart do Controller vem com o recurso desligado neste laboratório (`disable_rightsizing = true`, o padrão do `variables.tf`).
+- **Metrics Server**: fonte das métricas de consumo dos pods. O cluster do laboratório não tem um Metrics Server, e o chart do Controller consegue instalá-lo com `deploy_metrics_server = true`.
+
+O arquivo [09-rightsizing.tfvars](./scenarios/09-rightsizing.tfvars) altera somente o Controller:
+
+```hcl
+controller = {
+  disable_rightsizing   = false
+  deploy_metrics_server = true
+}
+```
+
+Diferente dos cenários anteriores, aqui não existe nenhuma mudança no cluster ou nos VNGs do Ocean: o `terraform apply` faz o upgrade do release Helm do Controller. Como os cenários não são cumulativos, aplicar o 09 também remove as configurações de scheduling do cenário anterior (janela de shutdown e tarefa agendada), que voltam para o padrão.
+
+#### Preparação
+
+Aplique o cenário e confira que o Controller e o Metrics Server estão rodando:
+
+```bash
+terraform plan -out plan -var-file=scenarios/09-rightsizing.tfvars
+terraform apply plan
+kubectl -n spot-system get pods
+```
+
+Quando o Metrics Server estiver `Running`, o comando `kubectl top nodes` passa a funcionar.
+
+Em seguida, faça o deploy do workload [oversized](./workloads/oversized.yaml). Ele é um nginx que pede **1 CPU e 2 GiB de memória**, mas não faz nada, então usa quase nada disso:
+
+```bash
+kubectl apply -f workloads/oversized.yaml
+kubectl top pods -l app=oversized
+kubectl get pods -l app=oversized -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.containers[0].resources.requests}{"\n"}{end}'
+```
+
+Output top pods:
+```sh
+NAME                        CPU(cores)   MEMORY(bytes)   
+oversized-97cd986b7-626pw   0m           2Mi             
+oversized-97cd986b7-ws668   0m           4Mi             
+```
+
+Output do get pods:
+```sh
+oversized-97cd986b7-626pw {"cpu":"1","memory":"2Gi"}
+oversized-97cd986b7-ws668 {"cpu":"1","memory":"2Gi"}
+```
+
+Compare as duas saídas: o consumo é próximo de zero de CPU e poucos MiB de memória, contra os requests de 1 CPU e 2 GiB. Essa diferença é o que o Right Sizing vai apontar.
+
+#### Validação
+
+No console da Spot, abra a aba **Right Sizing** do cluster. Na visão **Dashboard**, ela mostra a diferença entre o que foi solicitado e o que foi usado, e a sugestão de valores para os requests.
+
+![Dashboard de Right Sizing no console do Ocean](./images/right_sizing.png)
+
+> O topo da tela mostra a **economia mensal máxima potencial** e, ao lado, quanto é possível reduzir de vCPU e de memória, comparando o que foi pedido (`Requested`) com o que foi usado (`Used`). Os gráficos mostram, ao longo do tempo, o valor requisitado, o percentil de uso (85th percentile, que pode ser alterado) e a **recomendação** do Ocean. Passando o mouse sobre o gráfico, você vê os três valores no mesmo instante. Os filtros no topo (namespaces, workloads e containers) permitem analisar somente o que interessa, e os números da imagem incluem **todos os workloads do cluster**, e não somente o `oversized`. O botão **Start Optimizing** leva para a aplicação das recomendações.
+
+> As sugestões **não aparecem imediatamente**: o Ocean precisa coletar o consumo por um período antes de recomendar valores. Logo depois de aplicar o cenário, a aba pode estar vazia, mesmo com o `kubectl top` já mostrando o consumo, e o dashboard completo pode levar horas. Volte à aba depois de algum tempo com o workload rodando.
+
+#### Aplicando as recomendações automaticamente
+
+Por padrão, as recomendações aparecem na aba **Right Sizing** e são aplicadas por alguém, usando o botão **Start Optimizing**. Para que o Ocean aplique as recomendações sozinho, sem ninguém usar o console, criamos uma **regra de Right Sizing** com o Terraform.
+
+Esse cenário tem um arquivo próprio, [09-rightsizing-auto.tfvars](./scenarios/09-rightsizing-auto.tfvars), com as mesmas configurações do Controller do cenário anterior mais a regra:
+
+```hcl
+right_sizing = {
+  enabled          = true
+  namespaces       = ["default"]
+  restart_replicas = "MORE_THAN_ONE_REPLICA"
+  start_time       = "00:00"
+  end_time         = "23:59"
+}
+```
+
+Em [right_sizing.tf](./right_sizing.tf), a variável cria dois recursos da Spot (não existe módulo do terraform-aws-modules para eles):
+
+- **`spotinst_ocean_right_sizing_cluster_config`**: as configurações do Right Sizing para o cluster todo, como o percentil usado para calcular as recomendações (CPU: 85, 90, 95 ou 99; memória: 85, 90, 95 ou 100). Esse recurso só pode ser criado e alterado pelo Terraform: a API não permite removê-lo, então ele continua existindo enquanto o cluster do Ocean existir.
+- **`spotinst_ocean_right_sizing_rule`**: a regra em si. Os principais parâmetros são:
+  - `auto_apply_definition`: liga a aplicação automática e define os `namespaces` cujos workloads seguem a regra.
+  - `restart_replicas`: como os pods são reiniciados para receber os novos requests. Os valores aceitos são `MORE_THAN_ONE_REPLICA`, `ALL_MANIFEST`, `NO_RESTART` e `IN_PLACE_OR_RECREATE`. Alterar os requests de um Deployment recria os seus pods.
+  - `recommendation_application_intervals`: a janela semanal em que as recomendações podem ser aplicadas, com os dias em maiúsculas (`MONDAY`, `TUESDAY`, ...) e os horários no formato `HH:MM`. No laboratório a janela é o dia inteiro, em todos os dias, para o resultado aparecer logo. Em produção, use um horário de baixo movimento.
+
+A regra também aceita limites mínimos e máximos de CPU e memória (`recommendation_application_boundaries`), uma variação mínima para uma recomendação ser aplicada (`recommendation_application_min_threshold`) e uma margem adicional sobre o valor recomendado (`recommendation_application_overhead_values`). Esses três são os que protegem os workloads de receberem requests pequenos demais.
+
+Para aplicar:
+
+```bash
+terraform plan -out plan -var-file=scenarios/09-rightsizing-auto.tfvars
+terraform apply plan
+```
+
+> **Atenção:** a aplicação automática **altera os requests dos Deployments diretamente no cluster**. Se os manifestos forem gerenciados por GitOps (Argo CD, Flux) ou pelo próprio Terraform, os valores do Git deixam de bater com os do cluster, e a ferramenta pode desfazer a alteração do Ocean. Nesse caso, aplique as recomendações no manifesto, e use a aplicação automática somente em ambientes de teste ou em namespaces que não são gerenciados dessa forma.
+
+> **Atenção:** no teste deste laboratório, a API da Spot **recusou a criação de qualquer regra com `auto_apply_definition.enabled = true`**, com o erro genérico `FAILED_TO_CREATE_RULE`, sem informar o motivo, independente do namespace, dos workloads ou da configuração de restart. Regras sem a aplicação automática foram criadas normalmente na mesma conta, e por isso o motivo parece ser a aplicação automática em si, que pode depender de uma habilitação na conta ou na organização da Spot. Se você receber o mesmo erro, confirme com o suporte da Spot, e use o **Start Optimizing** do console enquanto isso.
+
+#### Custo x Benefício
+
+Reduzir os requests de pods superdimensionados faz o mesmo cluster caber em menos nodes, e é uma economia que somada ao Spot costuma ser significativa. O risco é o oposto: requests abaixo do consumo real fazem os pods sofrerem com throttling de CPU ou serem encerrados por falta de memória (`OOMKilled`). Por isso trate as sugestões como uma recomendação a ser revisada, e não como algo para aplicar às cegas, principalmente em workloads com picos de uso.
