@@ -1,0 +1,5 @@
+{
+  "commands": [
+    "for i in $(seq $(nproc)); do timeout 600 sh -c 'while :; do :; done' & done; wait"
+  ]
+}

@@ -1,0 +1,107 @@
+# Loads the Spot credentials (TF_VAR_spotinst_token, TF_VAR_spotinst_account) from a local, untracked file
+[env]
+_.file = ".env"
+# Same profile as locals.tf, used by the aws commands of the lab
+AWS_PROFILE = "services-admin"
+
+# Parses the Spot API responses of the roll tasks
+[tools]
+jq = "latest"
+
+# Support commands for the scenarios, run with `mise run <task>`
+[tasks.instances]
+description = "Instances of the group: ID, type, Spot or On-Demand, AZ and state"
+run = '''
+aws ec2 describe-instances \
+  --filters "Name=tag:elastic-lab/group,Values=elastic-lab" "Name=instance-state-name,Values=pending,running,shutting-down" \
+  --query "Reservations[].Instances[].[InstanceId,InstanceType,InstanceLifecycle||'on-demand',Placement.AvailabilityZone,State.Name]" \
+  --output table
+'''
+
+[tasks.targets]
+description = "Health of the instances in the ALB target group"
+run = '''
+aws elbv2 describe-target-health --target-group-arn "$(terraform output -raw target_group_arn)" \
+  --query "TargetHealthDescriptions[].[Target.Id,TargetHealth.State]" --output table
+'''
+
+[tasks.hits]
+description = "10 requests to the app"
+run = '''
+APP=$(terraform output -raw app_url)
+for i in $(seq 10); do curl -s "$APP"; done
+'''
+
+[tasks.status]
+description = "HTTP status code of one request to the app"
+run = '''
+curl -s -o /dev/null -w "%{http_code}\n" "$(terraform output -raw app_url)"
+'''
+
+[tasks.watch-status]
+description = "One request per second, printing only the HTTP status code"
+run = '''
+APP=$(terraform output -raw app_url)
+while true; do curl -s -o /dev/null -w "%{http_code} " "$APP"; sleep 1; done
+'''
+
+[tasks.watch-version]
+description = "One request per second, printing the app version and the instance"
+run = '''
+APP=$(terraform output -raw app_url)
+while true; do curl -s "$APP" | cut -d' ' -f1,2; sleep 1; done
+'''
+
+[tasks.stop-nginx]
+description = "Stop nginx on one instance through SSM (the first running one if no ID is given)"
+usage = 'arg "[instance_id]" help="Instance to break"'
+run = '''
+ID=${usage_instance_id:-$(aws ec2 describe-instances \
+  --filters "Name=tag:elastic-lab/group,Values=elastic-lab" "Name=instance-state-name,Values=running" \
+  --query "Reservations[0].Instances[0].InstanceId" --output text)}
+echo "Stopping nginx on $ID"
+aws ssm send-command --document-name AWS-RunShellScript --instance-ids "$ID" \
+  --parameters '{"commands":["systemctl stop nginx"]}' --query Command.CommandId --output text
+'''
+
+[tasks.cpu-load]
+description = "Keep every vCPU of the current instances at 100% for 10 minutes, through SSM"
+run = '''
+aws ssm send-command --document-name AWS-RunShellScript \
+  --targets "Key=tag:elastic-lab/group,Values=elastic-lab" \
+  --parameters file://scripts/cpu-load.json --query Command.CommandId --output text
+'''
+
+[tasks.roll]
+description = "Start a blue/green roll of every instance of the group, through the Spot API"
+usage = 'flag "--batch <percentage>" default="50" help="Percentage of the instances replaced per batch"'
+run = '''
+curl -s -X PUT -H "Authorization: Bearer $TF_VAR_spotinst_token" -H "Content-Type: application/json" \
+  "https://api.spotinst.io/aws/ec2/group/$(terraform output -raw elastigroup_id)/roll?accountId=$TF_VAR_spotinst_account" \
+  -d "{\"batchSizePercentage\": ${usage_batch}, \"gracePeriod\": 180, \"healthCheckType\": \"TARGET_GROUP\", \"strategy\": {\"action\": \"REPLACE_SERVER\"}}" \
+  | jq -r '.response.status.code as $c | .response.items[0] // .response.errors // {} | "\($c) \(.id // "") \(.status // "") \(.message // "")"'
+'''
+
+[tasks.roll-status]
+description = "Status and progress of the latest rolls of the group"
+run = '''
+curl -s -H "Authorization: Bearer $TF_VAR_spotinst_token" \
+  "https://api.spotinst.io/aws/ec2/group/$(terraform output -raw elastigroup_id)/roll?accountId=$TF_VAR_spotinst_account" \
+  | jq -r '.response.items[-3:][] | "\(.id) \(.status) \(.progress.value // 0)% \(.createdAt)"'
+'''
+
+[tasks.fis-start]
+description = "Start the FIS experiment that interrupts one Spot instance"
+run = '''
+aws fis start-experiment --experiment-template-id "$(terraform output -raw fis_experiment_template_id)" \
+  --query experiment.id --output text
+'''
+
+[tasks.fis-status]
+description = "Status of the latest FIS experiment of the lab"
+run = '''
+TEMPLATE=$(terraform output -raw fis_experiment_template_id)
+aws fis list-experiments \
+  --query "sort_by(experiments[?experimentTemplateId=='$TEMPLATE'], &creationTime)[-1].[id,state.status]" \
+  --output text
+'''
