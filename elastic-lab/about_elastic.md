@@ -22,6 +22,7 @@ O objetivo é o mesmo do Ocean: **reduzir o custo de computação** com Spot (at
 - **Uso inteligente de Spot** — *market scoring*, distribuição entre vários tipos e zonas de disponibilidade, e substituição proativa antes das interrupções.
 - **Fallback para On-Demand e Revert to Spot** — usa On-Demand quando não há capacidade Spot, e volta para Spot assim que possível (sempre, nunca ou em uma janela de horário).
 - **Mistura de mercados** — percentual de Spot (`spot_percentage`) ou uma quantidade fixa de instâncias On-Demand (`ondemand_count`) como base garantida.
+- **Orientation** — a estratégia de escolha dos mercados Spot: priorizar o custo (`costOriented`), a disponibilidade (`availabilityOriented`), o equilíbrio entre os dois (`balanced`) ou a distribuição igual entre zonas (`equalAzDistribution`).
 - **Aproveitamento de compromissos** — utiliza Reserved Instances e Savings Plans livres antes de lançar instâncias novas.
 - **Escalonamento** — políticas simples e por *step* (como as do ASG), *target tracking* em métricas como CPU ou requisições por target do ALB, e **Predictive Autoscaling**, que prevê a carga com machine learning e escala com antecedência.
 - **Deployments blue/green (Roll)** — troca de todas as instâncias em lotes quando a configuração muda (nova AMI, novo user data), verificando a saúde de cada lote antes de seguir.

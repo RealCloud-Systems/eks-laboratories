@@ -23,7 +23,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/).
 | # | Cenário | Arquivo | O que explora |
 |---|---------|---------|---------------|
 | 01 | [Configuração do Elastigroup](#configuração-do-elastigroup) | [01-baseline.tfvars](./scenarios/01-baseline.tfvars) | Grupo com 2 instâncias Spot, fallback para On-Demand e registro no ALB |
-| 02 | [Explorando os mercados: Spot e On-Demand](#explorando-os-mercados-spot-e-on-demand) | [02-markets.tfvars](./scenarios/02-markets.tfvars) | Base fixa de On-Demand com `ondemand_count`, tipos Spot preferidos, `orientation` e um Roll pela API para aplicar a mudança |
+| 02 | [Explorando os mercados: Spot e On-Demand](#explorando-os-mercados-spot-e-on-demand) | [02-markets.tfvars](./scenarios/02-markets.tfvars) | Base fixa de On-Demand com `ondemand_count`, tipos Spot preferidos e um Roll pela API para aplicar a mudança (com uma explicação do `orientation`) |
 | 03 | [Explorando o Auto Healing](#explorando-o-auto-healing) | [03-auto-healing.tfvars](./scenarios/03-auto-healing.tfvars) | Health check pelo Target Group e substituição de instâncias doentes |
 | 04 | [Explorando o Scaling](#explorando-o-scaling) | [04-scaling.tfvars](./scenarios/04-scaling.tfvars) | Target tracking na CPU média do grupo, scale up e scale down |
 | 05 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [05-spot-interruption.tfvars](./scenarios/05-spot-interruption.tfvars) | Interrupção de uma instância Spot com o AWS FIS e a reposição pelo Elastigroup |
@@ -180,11 +180,22 @@ O Elastigroup oferece duas formas de misturar os mercados:
 E duas formas de influenciar a escolha das instâncias Spot:
 
 - **`instance_types_preferred_spot`**: tipos que o Elastigroup tenta usar primeiro, desde que o mercado esteja saudável. Os demais tipos de `instance_types_spot` continuam disponíveis como alternativa.
-- **`orientation`**: a estratégia de escolha dos mercados:
-  - `balanced` (padrão): equilibra custo e disponibilidade.
-  - `costOriented`: prioriza os mercados mais baratos.
-  - `availabilityOriented`: prioriza os mercados com menor risco de interrupção.
-  - `equalAzDistribution`: distribui as instâncias igualmente entre as zonas de disponibilidade.
+- **`orientation`**: a estratégia de escolha dos mercados, descrita abaixo.
+
+##### Orientation: a estratégia de escolha dos mercados
+
+Para cada instância Spot, o Elastigroup escolhe um **mercado**: a combinação de um tipo de instância com uma zona de disponibilidade. O `orientation` (no console da Spot, **Cluster Orientation**) define o que pesa mais nessa escolha:
+
+| Valor | Prioriza | Quando usar |
+|-------|----------|-------------|
+| `balanced` (padrão do laboratório) | Equilíbrio entre preço e risco de interrupção | A maioria dos workloads stateless |
+| `costOriented` | Os mercados mais baratos, mesmo com um risco de interrupção maior | Workloads que toleram bem as interrupções, como batch e CI |
+| `availabilityOriented` | Os mercados com menor risco de interrupção, mesmo que mais caros | Workloads mais sensíveis à troca de instâncias |
+| `equalAzDistribution` | A mesma quantidade de instâncias em cada zona de disponibilidade | Quando a distribuição entre zonas importa mais do que o preço |
+
+Para testar um valor no laboratório, defina-o no bloco `elastigroup` de um arquivo de cenário, por exemplo `orientation = "costOriented"`. Como o `ondemand_count`, ele vale somente para **novos lançamentos**: depois do apply, use `mise run roll` para trocar as instâncias que já existem.
+
+> Este laboratório não tem um cenário para o `orientation`. O efeito dele depende do preço e do risco de cada mercado no momento, e com um grupo pequeno, de 2 instâncias e tipos do mesmo tamanho, valores diferentes podem escolher os mesmos tipos. A diferença aparece em grupos maiores, com uma lista grande de tipos.
 
 O arquivo [02-markets.tfvars](./scenarios/02-markets.tfvars) configura:
 
