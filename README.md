@@ -1,6 +1,10 @@
-# Terraform for RealCloud Pocs
+# Terraform for RealCloud Laboratories
 
-Repositório de provas de conceito (PoCs) de infraestrutura na AWS com Terraform. Cada pasta na raiz é um projeto Terraform independente, com o seu próprio state, e pode depender dos outputs de outro projeto.
+Aqui você encontra laboratórios guiados para testar os produtos RealCloud em seu ambiente na nuvem.
+Confira abaixo quais laboratórios nós temos.
+E lembre-se, que sempre que terminar um laboratório, de destruir a infraestrutura para evitar custos indesejados.
+
+Bom laboratório!
 
 ## Projetos
 
