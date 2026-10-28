@@ -26,6 +26,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/).
 | 02 | [Explorando os mercados: Spot e On-Demand](#explorando-os-mercados-spot-e-on-demand) | [02-markets.tfvars](./scenarios/02-markets.tfvars) | Base fixa de On-Demand com `ondemand_count`, tipos Spot preferidos, `orientation` e um Roll pela API para aplicar a mudança |
 | 03 | [Explorando o Auto Healing](#explorando-o-auto-healing) | [03-auto-healing.tfvars](./scenarios/03-auto-healing.tfvars) | Health check pelo Target Group e substituição de instâncias doentes |
 | 04 | [Explorando o Scaling](#explorando-o-scaling) | [04-scaling.tfvars](./scenarios/04-scaling.tfvars) | Target tracking na CPU média do grupo, scale up e scale down |
+| 05 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [05-spot-interruption.tfvars](./scenarios/05-spot-interruption.tfvars) | Interrupção de uma instância Spot com o AWS FIS e a reposição pelo Elastigroup |
 
 Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
@@ -106,23 +107,26 @@ Em vez de lançar todas as instâncias no mesmo tipo, o Elastigroup distribui o 
 
 **Tags**
 
-O Elastigroup aplica as tags do bloco `tags` em todas as instâncias que lança. O laboratório usa a tag `elastic-lab/group = elastic-lab` para encontrar as instâncias nos comandos da AWS CLI e no SSM.
+O Elastigroup aplica as tags do bloco `tags` em todas as instâncias que lança. O laboratório usa a tag `elastic-lab/group = elastic-lab` para encontrar as instâncias nos comandos da AWS CLI, no SSM e no FIS.
 
 > **Documentação do Elastigroup:** [Criar um Elastigroup](https://docs.flexera.com/spot/elastigroup/tutorials/elastigroup-tasks/create-an-elastigroup-from-scratch-nw) | [Visão geral dos grupos no console](https://docs.flexera.com/spot/elastigroup/tutorials/elastigroup-actions-menu/elastigroup-overview) | [Capacidade em instâncias ou ponderada](https://docs.flexera.com/spot/elastigroup/features/core-features/elastigroup-capacity-instances-or-weighted)
 
 #### Validação
 
-**Comandos de apoio**: o [mise.toml](./mise.toml) desta pasta tem tasks do mise usadas nos cenários. Elas leem a URL da aplicação e o ARN do Target Group dos outputs do Terraform, e usam o `AWS_PROFILE` definido no próprio `mise.toml` (ajuste caso use outro profile, junto com o [locals.tf](./locals.tf)):
+**Comandos de apoio**: o [mise.toml](./mise.toml) desta pasta tem tasks do mise usadas nos cenários. Elas leem a URL da aplicação, o ARN do Target Group e o template do FIS dos outputs do Terraform, e usam o `AWS_PROFILE` definido no próprio `mise.toml` (ajuste caso use outro profile, junto com o [locals.tf](./locals.tf)):
 
 | Task | O que faz |
 |------|-----------|
 | `mise run instances` | Instâncias do grupo: ID, tipo, Spot ou On-Demand, zona e estado |
 | `mise run targets` | Saúde das instâncias no Target Group do ALB |
 | `mise run hits` | 10 requisições para a aplicação |
+| `mise run watch-status` | Uma requisição por segundo, mostrando somente o código HTTP |
 | `mise run stop-nginx [id]` | Para o nginx de uma instância pelo SSM ([Auto Healing](#explorando-o-auto-healing)) |
 | `mise run cpu-load` | Gera 100% de CPU nas instâncias por 15 minutos pelo SSM ([Scaling](#explorando-o-scaling)) |
 | `mise run roll [--batch 50]` | Inicia um Roll do grupo pela API da Spot ([Mercados](#explorando-os-mercados-spot-e-on-demand)) |
 | `mise run roll-status` | Status e progresso dos últimos Rolls do grupo |
+| `mise run fis-start` | Inicia o experimento do FIS ([Interrupções Spot](#explorando-as-interrupções-das-máquinas-spot)) |
+| `mise run fis-status` | Status do último experimento do FIS |
 
 Para listar as tasks: `mise tasks`.
 
@@ -374,6 +378,77 @@ mise run roll-status
 #### Custo x Benefício
 
 Um alvo de CPU baixo deixa mais folga para picos, mas mantém mais instâncias ligadas. Um alvo alto economiza, mas deixa a aplicação mais perto do limite enquanto as novas instâncias sobem. Como o Elastigroup usa Spot, escalar para cima custa bem menos do que em um ASG On-Demand, o que permite alvos mais conservadores.
+
+### Explorando as interrupções das máquinas Spot
+
+A AWS pode **retomar uma instância Spot** a qualquer momento, avisando com 2 minutos de antecedência. Neste cenário vamos provocar essa interrupção e ver como o Elastigroup reage.
+
+#### Como funciona
+
+O Elastigroup tenta evitar as interrupções: ele acompanha o histórico dos mercados Spot e substitui instâncias com risco alto **antes** que a AWS as retome. Quando a interrupção acontece mesmo assim, ele recebe o aviso, tira a instância interrompida do Target Group, para que o ALB pare de mandar tráfego para ela antes de ela desaparecer, e lança uma instância substituta (em outro mercado Spot ou, se não houver, On-Demand).
+
+Para provocar a interrupção usamos o **AWS Fault Injection Service (FIS)**, como no [Ocean Lab](../ocean-lab/lab_ocean.md#explorando-as-interrupções-das-máquinas-spot). A ação `aws:ec2:send-spot-instance-interruptions` envia para uma instância o mesmo aviso de uma interrupção real.
+
+O arquivo [05-spot-interruption.tfvars](./scenarios/05-spot-interruption.tfvars) configura:
+
+```hcl
+fis = {
+  enabled = true # cria a role e o experimento do FIS
+}
+```
+
+O [fis.tf](./fis.tf) cria uma role que só pode enviar avisos de interrupção, e um *experiment template* que seleciona **somente uma** instância Spot (`COUNT(1)`) com a tag `elastic-lab/group = elastic-lab`.
+
+Aplique o cenário e confira que o grupo tem 2 instâncias Spot saudáveis:
+
+```bash
+terraform plan -out plan -var-file=scenarios/05-spot-interruption.tfvars
+terraform apply plan
+mise run instances
+mise run targets
+```
+
+#### Validação
+
+1. **Deixe as requisições rodando** em um terminal, para ver se alguma falha durante a interrupção:
+
+   ```bash
+   mise run watch-status
+   ```
+
+2. **Inicie o experimento** com o template do output do Terraform, e acompanhe o status (`initiating`, `running` e `completed`) do último experimento:
+
+   ```bash
+   mise run fis-start
+   mise run fis-status
+   ```
+
+3. **Acompanhe as instâncias e o Target Group**:
+
+   ```bash
+   mise run instances
+   mise run targets
+   ```
+
+   A sequência esperada é:
+
+   1. Segundos após o aviso, o Elastigroup tira a instância interrompida do Target Group (ela passa para `draining`) e a desanexa do grupo.
+   2. Cerca de 15 segundos depois, ele lança a instância substituta, como uma recuperação da instância (*instance recovery*).
+   3. Ao final dos 2 minutos, a AWS encerra a instância interrompida. A substituta fica `healthy` depois que o nginx é instalado.
+
+   Durante todo o processo, as requisições devem continuar respondendo `200`: enquanto a substituta sobe, a outra instância atende sozinha, e a interrompida já saiu do ALB antes de ser encerrada.
+
+4. **Console**: a aba **Log** do grupo registra a interrupção e a recuperação da instância:
+
+   ![Interrupção e recuperação da instância na aba Log](./images/log_interruption.png)
+
+   > Lendo de baixo para cima: a instância interrompida é removida do Target Group e desanexada do grupo com o motivo `Detach instances due to interruption`. Cerca de 15 segundos depois, o Elastigroup faz a recuperação: a instância interrompida sai do grupo (`Scale down as part of instance recovery`), a substituta é lançada (`Scale up as part of instance recovery`), e a recuperação é concluída. Os IDs e os horários serão os do seu ambiente.
+
+> **Documentação:** [Compute](https://docs.flexera.com/spot/elastigroup/features/compute), com a substituição das instâncias Spot | [Ações do AWS FIS](https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html)
+
+#### Custo x Benefício
+
+Uma interrupção não derruba a aplicação quando ela tem mais de uma instância, em zonas diferentes, atrás de um load balancer. Com uma única instância, a aplicação ficaria fora do ar entre o encerramento e a subida da substituta. Por isso, para usar Spot com segurança, mantenha pelo menos 2 instâncias e uma lista grande de tipos.
 
 ## Limpeza
 
