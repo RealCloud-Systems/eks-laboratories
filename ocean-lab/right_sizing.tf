@@ -27,6 +27,43 @@ resource "spotinst_ocean_right_sizing_rule" "auto" {
   cpu_percentile    = var.right_sizing.cpu_percentile
   memory_percentile = var.right_sizing.memory_percentile
 
+  # Policies: guardrails on what the rule is allowed to apply (scenario 10)
+  downside_only                       = var.right_sizing.downside_only
+  exclude_preliminary_recommendations = var.right_sizing.exclude_preliminary_recommendations
+
+  dynamic "recommendation_application_hpa" {
+    for_each = var.right_sizing.allow_hpa_recommendations != null ? [1] : []
+    content {
+      allow_hpa_recommendations = var.right_sizing.allow_hpa_recommendations
+    }
+  }
+
+  dynamic "recommendation_application_boundaries" {
+    for_each = var.right_sizing.boundaries[*]
+    content {
+      cpu_min    = recommendation_application_boundaries.value.cpu_min
+      cpu_max    = recommendation_application_boundaries.value.cpu_max
+      memory_min = recommendation_application_boundaries.value.memory_min
+      memory_max = recommendation_application_boundaries.value.memory_max
+    }
+  }
+
+  dynamic "recommendation_application_min_threshold" {
+    for_each = var.right_sizing.min_threshold[*]
+    content {
+      cpu_percentage    = recommendation_application_min_threshold.value.cpu
+      memory_percentage = recommendation_application_min_threshold.value.memory
+    }
+  }
+
+  dynamic "recommendation_application_overhead_values" {
+    for_each = var.right_sizing.overhead[*]
+    content {
+      cpu_percentage    = recommendation_application_overhead_values.value.cpu
+      memory_percentage = recommendation_application_overhead_values.value.memory
+    }
+  }
+
   recommendation_application_intervals {
     repetition_basis = "WEEKLY"
 

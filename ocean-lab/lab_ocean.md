@@ -19,6 +19,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/), e os
 | 07 | [Explorando o Roll](#explorando-o-roll---atualização-em-lote-de-nodes) | [07-roll.tfvars](./scenarios/07-roll.tfvars) | Roll do cluster: troca dos nodes existentes em lotes após uma mudança de configuração |
 | 08 | [Explorando Scheduling: Shutdown hours](#explorando-scheduling-shutdown-hours) | [08-scheduling.tfvars](./scenarios/08-scheduling.tfvars) | Janelas de shutdown do cluster e tarefas agendadas (Roll com cron) |
 | 09 | [Explorando o Right Sizing](#explorando-o-right-sizing) | [09-rightsizing.tfvars](./scenarios/09-rightsizing.tfvars) e [09-rightsizing-auto.tfvars](./scenarios/09-rightsizing-auto.tfvars) | Right Sizing dos requests dos pods com o Controller e o Metrics Server, e a aplicação automática das recomendações |
+| 10 | [Explorando as políticas do Right Sizing automático](#explorando-as-políticas-do-right-sizing-automático) | [10-rightsizing-policies.tfvars](./scenarios/10-rightsizing-policies.tfvars) | Limites, margem, variação mínima e redução apenas na regra de Right Sizing automático |
 
 Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
@@ -931,6 +932,86 @@ terraform apply plan
 Reduzir os requests de pods superdimensionados faz o mesmo cluster caber em menos nodes, e é uma economia que somada ao Spot costuma ser significativa. O risco é o oposto: requests abaixo do consumo real fazem os pods sofrerem com throttling de CPU ou serem encerrados por falta de memória (`OOMKilled`). Por isso trate as sugestões como uma recomendação a ser revisada, e não como algo para aplicar às cegas, principalmente em workloads com picos de uso.
 
 > **Documentação do Ocean:** [Right Sizing automático](https://docs.flexera.com/spot/ocean/features/automatic-right-sizing) | [Recomendações e regras de Right Sizing](https://docs.flexera.com/spot/ocean/features/automatic-right-sizing/ocean-cluster-right-sizing-recom-tab)
+
+### Explorando as políticas do Right Sizing automático
+
+A regra do cenário 09 aplica a recomendação do Ocean do jeito que ela vem. No caso do `oversized`, que usa quase nada, a recomendação fica perto de zero: um pod com requests tão baixos cabe em qualquer lugar, mas qualquer pico de uso já causa throttling de CPU ou `OOMKilled`. As **políticas** da regra são as proteções que limitam o que o Ocean pode aplicar, independente do que ele recomendou.
+
+#### Como funciona
+
+O arquivo [10-rightsizing-policies.tfvars](./scenarios/10-rightsizing-policies.tfvars) repete o Controller e a regra do 09-rightsizing-auto, e adiciona as políticas:
+
+```hcl
+right_sizing = {
+  # ... mesma regra do 09-rightsizing-auto
+
+  downside_only                       = true
+  exclude_preliminary_recommendations = false
+  allow_hpa_recommendations           = false
+
+  boundaries = {
+    cpu_min    = 0.25
+    cpu_max    = 1
+    memory_min = 0.25
+    memory_max = 2
+  }
+
+  min_threshold = {
+    cpu    = 0.1
+    memory = 0.1
+  }
+
+  overhead = {
+    cpu    = 0.2
+    memory = 0.2
+  }
+}
+```
+
+Em [right_sizing.tf](./right_sizing.tf), cada política vira um parâmetro do `spotinst_ocean_right_sizing_rule`:
+
+| Variável | Parâmetro da regra | O que faz |
+|----------|--------------------|-----------|
+| `boundaries` | `recommendation_application_boundaries` | Requests mínimos e máximos que a regra pode aplicar, CPU em vCPU e memória em GiB. No laboratório, nunca abaixo de 250m e 256 MiB, nem acima de 1 vCPU e 2 GiB. |
+| `overhead` | `recommendation_application_overhead_values` | Margem somada à recomendação, em fração (`0.2` = 20%), para absorver picos acima do percentil usado no cálculo. |
+| `min_threshold` | `recommendation_application_min_threshold` | Variação mínima, em fração (`0.1` = 10%), para uma recomendação ser aplicada. Evita reiniciar os pods por uma mudança pequena. |
+| `downside_only` | `downside_only` | A regra só reduz requests. Um aumento recomendado fica para alguém revisar, porque pode subir nodes novos. |
+| `exclude_preliminary_recommendations` | `exclude_preliminary_recommendations` | Ignora recomendações calculadas com menos de 4 dias de dados. Fica `false` no laboratório para o resultado aparecer logo; em produção, use `true`. |
+| `allow_hpa_recommendations` | `recommendation_application_hpa` | Se a regra também altera workloads com HPA. Mudar os requests de um workload com HPA de CPU muda o ponto em que ele escala, então fica `false`. |
+
+Todas são opcionais: as que o cenário não define continuam com o padrão do Ocean, por isso o cenário 09-rightsizing-auto continua gerando a mesma regra de antes.
+
+#### Preparação
+
+Aplique o cenário e mantenha o `oversized` rodando (se ele não estiver no cluster, faça o deploy como no cenário 09):
+
+```bash
+terraform plan -out plan -var-file=scenarios/10-rightsizing-policies.tfvars
+terraform apply plan
+kubectl apply -f workloads/oversized.yaml
+```
+
+Se a regra do 09-rightsizing-auto já existir, o plano mostra a **mesma regra sendo alterada** (`update in-place`), com os novos blocos de políticas, e não uma regra nova.
+
+> A criação da regra com `auto_apply_definition.enabled = true` pode falhar com `FAILED_TO_CREATE_RULE`, pelo mesmo motivo descrito no cenário 09-rightsizing-auto.
+
+#### Validação
+
+No console da Spot, abra a aba **Right Sizing** do cluster, e na lista de regras abra a regra `<nome>-auto`. Os limites, a margem e a variação mínima aparecem nos parâmetros da regra.
+
+Quando a regra for aplicada ao `oversized`, confira os novos requests:
+
+```bash
+kubectl get pods -l app=oversized -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.containers[0].resources.requests}{"\n"}{end}'
+```
+
+O esperado é que os requests parem nos **limites mínimos** (`250m` de CPU e `256Mi` de memória), e não no valor perto de zero que a recomendação sozinha aplicaria: o consumo do nginx, mesmo com a margem de 20%, fica abaixo do mínimo. Compare com a recomendação mostrada no **Dashboard**, que continua sendo a recomendação crua, sem as políticas.
+
+#### Custo x Benefício
+
+As políticas reduzem a economia máxima: com um mínimo de 250m, o `oversized` reserva mais do que usa, e a margem de 20% repete isso em todos os workloads. Em troca, a aplicação automática passa a ter um pior caso conhecido, e é isso que permite deixá-la ligada sem revisar cada recomendação. Comece com limites e margem conservadores, e reduza-os conforme os workloads se mostrarem estáveis.
+
+> **Documentação do Ocean:** [Recomendações e regras de Right Sizing](https://docs.flexera.com/spot/ocean/features/automatic-right-sizing/ocean-cluster-right-sizing-recom-tab) | [spotinst_ocean_right_sizing_rule](https://registry.terraform.io/providers/spotinst/spotinst/latest/docs/resources/ocean_right_sizing_rule)
 
 ## Limpeza
 

@@ -146,6 +146,28 @@ variable "right_sizing" {
     # Percentile used to calculate the recommendations, null keeps the Ocean default
     cpu_percentile    = optional(number)
     memory_percentile = optional(number)
+
+    # Policies of the rule, null keeps the Ocean default
+    downside_only                       = optional(bool) # only lowers requests, never raises them
+    exclude_preliminary_recommendations = optional(bool) # ignores recommendations with less than 4 days of data
+    allow_hpa_recommendations           = optional(bool) # also applies to workloads with an HPA
+    # Lowest and highest requests the rule can apply, CPU in vCPU and memory in GiB
+    boundaries = optional(object({
+      cpu_min    = optional(number)
+      cpu_max    = optional(number)
+      memory_min = optional(number)
+      memory_max = optional(number)
+    }))
+    # Minimum change for a recommendation to be applied, as a fraction (0.1 = 10%)
+    min_threshold = optional(object({
+      cpu    = optional(number)
+      memory = optional(number)
+    }))
+    # Margin added on top of the recommendation, as a fraction (0.2 = 20%)
+    overhead = optional(object({
+      cpu    = optional(number)
+      memory = optional(number)
+    }))
   })
   default = {}
 }
