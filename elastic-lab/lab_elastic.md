@@ -28,6 +28,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/).
 | 04 | [Explorando o Scaling](#explorando-o-scaling) | [04-scaling.tfvars](./scenarios/04-scaling.tfvars) | Target tracking na CPU média do grupo, scale up e scale down |
 | 05 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [05-spot-interruption.tfvars](./scenarios/05-spot-interruption.tfvars) | Interrupção de uma instância Spot com o AWS FIS e a reposição pelo Elastigroup |
 | 06 | [Explorando o Roll - Deploy blue/green](#explorando-o-roll---deploy-bluegreen) | [06-roll.tfvars](./scenarios/06-roll.tfvars) | Nova versão da aplicação trocando as instâncias em lotes |
+| 07 | [Explorando o Scheduling](#explorando-o-scheduling) | [07-scheduling.tfvars](./scenarios/07-scheduling.tfvars) | Tarefas com cron que desligam e religam o grupo |
 
 Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
@@ -36,7 +37,7 @@ terraform plan -out plan -var-file=scenarios/<cenário>.tfvars
 terraform apply plan
 ```
 
-> Os cenários **não são cumulativos**: cada arquivo altera somente alguns valores, e tudo o que ele não define volta para o padrão do [variables.tf](./variables.tf). Isso inclui a capacidade: todo apply volta o grupo para o `desired_capacity` de 2 instâncias, mesmo que uma política de escala tenha alterado esse valor.
+> Os cenários **não são cumulativos**: cada arquivo altera somente alguns valores, e tudo o que ele não define volta para o padrão do [variables.tf](./variables.tf). Isso inclui a capacidade: todo apply volta o grupo para o `desired_capacity` de 2 instâncias, mesmo que uma política de escala ou uma tarefa agendada tenha alterado esse valor.
 
 ## Passo a Passo
 
@@ -121,12 +122,14 @@ O Elastigroup aplica as tags do bloco `tags` em todas as instâncias que lança.
 | `mise run instances` | Instâncias do grupo: ID, tipo, Spot ou On-Demand, zona e estado |
 | `mise run targets` | Saúde das instâncias no Target Group do ALB |
 | `mise run hits` | 10 requisições para a aplicação |
+| `mise run status` | Código HTTP de uma requisição para a aplicação |
 | `mise run watch-status` | Uma requisição por segundo, mostrando somente o código HTTP |
 | `mise run watch-version` | Uma requisição por segundo, mostrando a versão da aplicação e a instância |
 | `mise run stop-nginx [id]` | Para o nginx de uma instância pelo SSM ([Auto Healing](#explorando-o-auto-healing)) |
 | `mise run cpu-load` | Gera 100% de CPU nas instâncias por 15 minutos pelo SSM ([Scaling](#explorando-o-scaling)) |
 | `mise run roll [--batch 50]` | Inicia um Roll do grupo pela API da Spot ([Mercados](#explorando-os-mercados-spot-e-on-demand)) |
 | `mise run roll-status` | Status e progresso dos últimos Rolls do grupo |
+| `mise run schedule` | Tarefas agendadas do grupo e a capacidade atual ([Scheduling](#explorando-o-scheduling)) |
 | `mise run fis-start` | Inicia o experimento do FIS ([Interrupções Spot](#explorando-as-interrupções-das-máquinas-spot)) |
 | `mise run fis-status` | Status do último experimento do FIS |
 
@@ -536,6 +539,86 @@ elastigroup = {
 #### Custo x Benefício
 
 Durante o Roll, as instâncias antigas e novas rodam ao mesmo tempo, e o custo sobe temporariamente. Em troca, a nova versão chega a todas as instâncias sem indisponibilidade e com uma validação de saúde a cada lote. Lotes menores deixam o deploy mais lento e mais seguro.
+
+### Explorando o Scheduling
+
+Ambientes de desenvolvimento e testes raramente precisam ficar ligados 24 horas por dia. O Elastigroup permite **agendar tarefas** no grupo com expressões cron, sem depender de scripts ou automações externas.
+
+#### Como funciona
+
+O bloco `scheduled_task` aceita alguns tipos de tarefa (`task_type`):
+
+- **`scale`**: altera a capacidade do grupo (`scale_target_capacity`, `scale_min_capacity` e `scale_max_capacity`).
+- **`roll`**: executa um Roll, com o `batch_size_percentage` da tarefa.
+- **`backup_ami`**: cria uma AMI a partir de uma instância do grupo.
+
+Os horários do cron são em **UTC**.
+
+O arquivo [07-scheduling.tfvars](./scenarios/07-scheduling.tfvars) configura duas tarefas:
+
+```hcl
+elastigroup = {
+  scheduled_tasks = [
+    {
+      task_type             = "scale"
+      cron_expression       = "0 19 * * *"  # todos os dias às 19:00 UTC: desliga
+      scale_target_capacity = 0
+      scale_min_capacity    = 0
+      scale_max_capacity    = 4
+    },
+    {
+      task_type             = "scale"
+      cron_expression       = "0 21 * * *"  # todos os dias às 21:00 UTC: religa, 2 horas depois
+      scale_target_capacity = 2
+      scale_min_capacity    = 1
+      scale_max_capacity    = 4
+    },
+  ]
+}
+```
+
+> **Atenção:** os horários do arquivo são só um exemplo. Para ver o resultado, **edite os dois crons**: a tarefa de desligar para poucos minutos à frente do horário atual em UTC (`date -u`), e a de religar para pelo menos 2 horas depois dela.
+
+> A tarefa de desligar precisa alterar também o `scale_min_capacity`, já que o grupo não pode ficar abaixo do mínimo. A de religar volta o mínimo para 1.
+
+#### Preparação
+
+```bash
+date -u
+terraform plan -out plan -var-file=scenarios/07-scheduling.tfvars
+terraform apply plan
+```
+
+#### Validação
+
+1. **Configuração**: confira as tarefas pela API da Spot, junto com a capacidade atual do grupo:
+
+   ```bash
+   mise run schedule
+   ```
+
+   ```
+   0 21 * * *	scale	target=2 min=1 max=4	enabled=true
+   0 19 * * *	scale	target=0 min=0 max=4	enabled=true
+   capacity now: target=2 min=1 max=4
+   ```
+
+   > Diferente do Ocean, que mostra as janelas de shutdown em uma grade semanal, o console do Elastigroup não tem uma tela para as tarefas agendadas: elas não aparecem na edição do grupo, somente no JSON da configuração do grupo (no bloco `scheduling.tasks`). Os crons ficam sempre em UTC.
+
+2. **Desligamento**: no horário da primeira tarefa, o Elastigroup remove todas as instâncias. O Target Group fica vazio e o ALB passa a responder `503`.
+
+   ```bash
+   mise run instances
+   mise run status
+   ```
+
+3. **Religamento**: no horário da segunda tarefa, o grupo volta para 2 instâncias, e a aplicação volta a responder depois que o nginx sobe.
+
+> Um apply feito entre as duas tarefas volta o grupo para os valores do Terraform (2 instâncias, mínimo de 1), religando o grupo antes da hora.
+
+#### Custo x Benefício
+
+Desligar um ambiente de dev das 19h às 7h e nos fins de semana corta cerca de 64% das horas da semana. A diferença para o shutdown hours do Ocean é que aqui o desligamento é feito com duas tarefas de escala, e você controla a capacidade de cada uma: por exemplo, reduzir para 1 instância à noite em vez de desligar.
 
 ## Limpeza
 

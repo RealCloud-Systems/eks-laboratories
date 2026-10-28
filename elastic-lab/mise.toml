@@ -90,6 +90,16 @@ curl -s -H "Authorization: Bearer $TF_VAR_spotinst_token" \
   | jq -r '.response.items[-3:][] | "\(.id) \(.status) \(.progress.value // 0)% \(.createdAt)"'
 '''
 
+[tasks.schedule]
+description = "Scheduled tasks of the group (cron in UTC) and its current capacity, from the Spot API"
+run = '''
+curl -s -H "Authorization: Bearer $TF_VAR_spotinst_token" \
+  "https://api.spotinst.io/aws/ec2/group/$(terraform output -raw elastigroup_id)?accountId=$TF_VAR_spotinst_account" \
+  | jq -r '.response.items[0] |
+      ((.scheduling.tasks // [])[] | "\(.cronExpression)\t\(.taskType)\ttarget=\(.scaleTargetCapacity // "-") min=\(.scaleMinCapacity // "-") max=\(.scaleMaxCapacity // "-")\tenabled=\(.isEnabled)"),
+      "capacity now: target=\(.capacity.target) min=\(.capacity.minimum) max=\(.capacity.maximum)"'
+'''
+
 [tasks.fis-start]
 description = "Start the FIS experiment that interrupts one Spot instance"
 run = '''
