@@ -27,6 +27,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/).
 | 03 | [Explorando o Auto Healing](#explorando-o-auto-healing) | [03-auto-healing.tfvars](./scenarios/03-auto-healing.tfvars) | Health check pelo Target Group e substituição de instâncias doentes |
 | 04 | [Explorando o Scaling](#explorando-o-scaling) | [04-scaling.tfvars](./scenarios/04-scaling.tfvars) | Target tracking na CPU média do grupo, scale up e scale down |
 | 05 | [Explorando as interrupções das máquinas Spot](#explorando-as-interrupções-das-máquinas-spot) | [05-spot-interruption.tfvars](./scenarios/05-spot-interruption.tfvars) | Interrupção de uma instância Spot com o AWS FIS e a reposição pelo Elastigroup |
+| 06 | [Explorando o Roll - Deploy blue/green](#explorando-o-roll---deploy-bluegreen) | [06-roll.tfvars](./scenarios/06-roll.tfvars) | Nova versão da aplicação trocando as instâncias em lotes |
 
 Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
@@ -121,6 +122,7 @@ O Elastigroup aplica as tags do bloco `tags` em todas as instâncias que lança.
 | `mise run targets` | Saúde das instâncias no Target Group do ALB |
 | `mise run hits` | 10 requisições para a aplicação |
 | `mise run watch-status` | Uma requisição por segundo, mostrando somente o código HTTP |
+| `mise run watch-version` | Uma requisição por segundo, mostrando a versão da aplicação e a instância |
 | `mise run stop-nginx [id]` | Para o nginx de uma instância pelo SSM ([Auto Healing](#explorando-o-auto-healing)) |
 | `mise run cpu-load` | Gera 100% de CPU nas instâncias por 15 minutos pelo SSM ([Scaling](#explorando-o-scaling)) |
 | `mise run roll [--batch 50]` | Inicia um Roll do grupo pela API da Spot ([Mercados](#explorando-os-mercados-spot-e-on-demand)) |
@@ -193,7 +195,7 @@ elastigroup = {
 }
 ```
 
-> **Atenção:** a mudança de mercados vale somente para **novos lançamentos** (scale up e substituições). O Elastigroup não converte uma instância Spot que já está rodando em On-Demand: sem um Roll, o grupo continuaria somente com Spot até alguma instância ser substituída. Por isso, depois do apply, o cenário inicia um Roll pela API da Spot com a task `mise run roll` (lotes de 50%, validados pelo Target Group).
+> **Atenção:** a mudança de mercados vale somente para **novos lançamentos** (scale up e substituições). O Elastigroup não converte uma instância Spot que já está rodando em On-Demand: sem um Roll, o grupo continuaria somente com Spot até alguma instância ser substituída. Por isso, depois do apply, o cenário inicia um Roll pela API da Spot com a task `mise run roll` (lotes de 50%, validados pelo Target Group). O Roll é explicado em detalhes no [cenário 06](#explorando-o-roll---deploy-bluegreen).
 
 > Ligar o `should_roll` no Terraform não resolve aqui: o `update_policy` não faz parte da configuração do grupo na API da Spot, e o provider só inicia um Roll quando o mesmo apply também altera o grupo. Se os mercados já tiverem sido aplicados antes, o apply não muda nada no grupo, e nenhum Roll acontece.
 
@@ -449,6 +451,80 @@ mise run targets
 #### Custo x Benefício
 
 Uma interrupção não derruba a aplicação quando ela tem mais de uma instância, em zonas diferentes, atrás de um load balancer. Com uma única instância, a aplicação ficaria fora do ar entre o encerramento e a subida da substituta. Por isso, para usar Spot com segurança, mantenha pelo menos 2 instâncias e uma lista grande de tipos.
+
+### Explorando o Roll - Deploy blue/green
+
+Mudanças na configuração de lançamento, como uma nova AMI ou um novo user data, valem somente para **novas instâncias**. Neste cenário vamos publicar uma nova versão da aplicação e usar o **Roll** do Elastigroup para trocar todas as instâncias existentes.
+
+#### Como funciona
+
+Um Roll troca as instâncias **em lotes**, no modelo blue/green: para cada lote, o Elastigroup sobe instâncias novas com a configuração atual, espera elas ficarem saudáveis e só então encerra as antigas. Se mais da metade das instâncias de um lote não ficar saudável no tempo de `grace_period`, o deploy falha e o Elastigroup para, sem trocar os lotes seguintes.
+
+Os parâmetros ficam no bloco `update_policy` do [elastigroup.tf](./elastigroup.tf):
+
+- **`should_roll`**: quando `true`, o apply do Terraform inicia um Roll depois de atualizar o grupo.
+- **`batch_size_percentage`**: o percentual de instâncias trocado em cada lote.
+- **`grace_period`**: quanto tempo o Elastigroup espera as instâncias novas ficarem saudáveis.
+- **`health_check_type`**: o health check usado para validar cada lote, aqui o Target Group.
+- **`strategy.action`**: `REPLACE_SERVER` sobe instâncias novas; `RESTART_SERVER` reinicia as existentes.
+
+O arquivo [06-roll.tfvars](./scenarios/06-roll.tfvars) configura:
+
+```hcl
+app = {
+  version = "v2" # muda o user data
+}
+
+elastigroup = {
+  roll = {
+    batch_size_percentage = 50  # 1 das 2 instâncias por vez
+    grace_period          = 180 # segundos
+    health_check_type     = "TARGET_GROUP"
+  }
+}
+```
+
+#### Validação
+
+1. **Deixe as requisições rodando** em um terminal, mostrando a versão de cada resposta:
+
+   ```bash
+   mise run watch-version
+   ```
+
+2. **Gere o plano e aplique o cenário**: o plano mostra a alteração do `user_data`, e o Roll começa ao final do apply.
+
+   > Aqui não é preciso o `mise run roll` do [cenário 02](#explorando-os-mercados-spot-e-on-demand): o provider inicia o Roll logo depois de atualizar o grupo, e a troca da versão altera o `user_data` no mesmo apply. Se o plano não mostrar a alteração do `user_data` (por exemplo, ao aplicar o cenário uma segunda vez, com o grupo já na `v2`), o apply não atualiza o grupo e nenhum Roll acontece. Nesse caso, use `mise run roll`.
+
+   ```bash
+   terraform plan -out plan -var-file=scenarios/06-roll.tfvars
+   terraform apply plan
+   ```
+
+3. **Acompanhe a troca**: com 2 instâncias e lotes de 50%, são 2 lotes. Nas requisições, as respostas `version=v1` vão dando lugar a `version=v2`, com as duas versões convivendo durante o Roll, sem nenhuma falha.
+
+   ```bash
+   mise run instances
+   mise run targets
+   ```
+
+   ![Respostas da v1 e da v2 alternando durante o Roll](./images/v1_and_v2_roll.png)
+
+   > Durante o primeiro lote, o ALB distribui as requisições entre a instância nova, já com a `v2`, e a instância antiga do segundo lote, ainda com a `v1`. No segundo lote, ela também é trocada, e todas as respostas passam a ser `v2`.
+
+4. **Console**: a aba **Deployments** do grupo mostra o Roll, os lotes e o status de cada um, com o horário de início e de término. A aba **Log** registra cada passo dos lotes:
+
+   ![Lotes do Roll na aba Log](./images/roll.png)
+
+   > Lendo de baixo para cima: o Roll começa com a configuração do `roll_config` (lotes de 50%, health check pelo `TARGET_GROUP` e `grace_period` de 180 segundos). Em cada lote, o Elastigroup primeiro lança a instância nova (`Launched as part of a deployment`) e a registra no Target Group, e só cerca de 3 minutos depois, com o `grace_period`, desanexa e encerra a antiga (`Detach as part of deployment`). As instâncias novas mantêm o mercado das antigas (`requested: 1.0 spot`). Com 2 lotes, o Roll terminou em cerca de 6 minutos. Os IDs e os horários serão os do seu ambiente.
+
+> Ao voltar para outro cenário, a versão volta para `v1` e o Roll fica desligado: as instâncias que já existem continuam com a `v2`, e somente as novas sobem com a `v1`. É o comportamento padrão sem Roll, e um bom exemplo de por que ele é necessário.
+
+> **Documentação do Elastigroup:** [Visão geral dos grupos e a aba Deployments](https://docs.flexera.com/spot/elastigroup/tutorials/elastigroup-actions-menu/elastigroup-overview)
+
+#### Custo x Benefício
+
+Durante o Roll, as instâncias antigas e novas rodam ao mesmo tempo, e o custo sobe temporariamente. Em troca, a nova versão chega a todas as instâncias sem indisponibilidade e com uma validação de saúde a cada lote. Lotes menores deixam o deploy mais lento e mais seguro.
 
 ## Limpeza
 
