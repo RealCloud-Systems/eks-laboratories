@@ -25,6 +25,7 @@ Cada cenário é um arquivo `.tfvars` dentro de [scenarios/](./scenarios/).
 | 01 | [Configuração do Elastigroup](#configuração-do-elastigroup) | [01-baseline.tfvars](./scenarios/01-baseline.tfvars) | Grupo com 2 instâncias Spot, fallback para On-Demand e registro no ALB |
 | 02 | [Explorando os mercados: Spot e On-Demand](#explorando-os-mercados-spot-e-on-demand) | [02-markets.tfvars](./scenarios/02-markets.tfvars) | Base fixa de On-Demand com `ondemand_count`, tipos Spot preferidos, `orientation` e um Roll pela API para aplicar a mudança |
 | 03 | [Explorando o Auto Healing](#explorando-o-auto-healing) | [03-auto-healing.tfvars](./scenarios/03-auto-healing.tfvars) | Health check pelo Target Group e substituição de instâncias doentes |
+| 04 | [Explorando o Scaling](#explorando-o-scaling) | [04-scaling.tfvars](./scenarios/04-scaling.tfvars) | Target tracking na CPU média do grupo, scale up e scale down |
 
 Um cenário é aplicado gerando o plano com o arquivo do cenário e aplicando o plano:
 
@@ -33,7 +34,7 @@ terraform plan -out plan -var-file=scenarios/<cenário>.tfvars
 terraform apply plan
 ```
 
-> Os cenários **não são cumulativos**: cada arquivo altera somente alguns valores, e tudo o que ele não define volta para o padrão do [variables.tf](./variables.tf). Isso inclui a capacidade: todo apply volta o grupo para o `desired_capacity` de 2 instâncias, mesmo que o Elastigroup tenha alterado esse valor.
+> Os cenários **não são cumulativos**: cada arquivo altera somente alguns valores, e tudo o que ele não define volta para o padrão do [variables.tf](./variables.tf). Isso inclui a capacidade: todo apply volta o grupo para o `desired_capacity` de 2 instâncias, mesmo que uma política de escala tenha alterado esse valor.
 
 ## Passo a Passo
 
@@ -119,6 +120,7 @@ O Elastigroup aplica as tags do bloco `tags` em todas as instâncias que lança.
 | `mise run targets` | Saúde das instâncias no Target Group do ALB |
 | `mise run hits` | 10 requisições para a aplicação |
 | `mise run stop-nginx [id]` | Para o nginx de uma instância pelo SSM ([Auto Healing](#explorando-o-auto-healing)) |
+| `mise run cpu-load` | Gera 100% de CPU nas instâncias por 15 minutos pelo SSM ([Scaling](#explorando-o-scaling)) |
 | `mise run roll [--batch 50]` | Inicia um Roll do grupo pela API da Spot ([Mercados](#explorando-os-mercados-spot-e-on-demand)) |
 | `mise run roll-status` | Status e progresso dos últimos Rolls do grupo |
 
@@ -297,6 +299,81 @@ terraform apply plan
 #### Custo x Benefício
 
 Um `unhealthy_duration` curto troca as instâncias doentes mais rápido, mas pode substituir instâncias que só estavam lentas por alguns segundos, por exemplo durante um pico de carga. Um `grace_period` curto demais faz o Elastigroup substituir instâncias que ainda estavam subindo, em um ciclo que nunca termina. Ajuste os dois de acordo com o tempo real de inicialização da aplicação.
+
+### Explorando o Scaling
+
+Até aqui, o grupo teve sempre 2 instâncias. Neste cenário o Elastigroup passa a **ajustar a capacidade de acordo com a carga**, usando uma política de *target tracking* na CPU.
+
+#### Como funciona
+
+O Elastigroup suporta os mesmos tipos de políticas de um Auto Scaling Group:
+
+- **Simple e step scaling**: adicionam ou removem instâncias quando uma métrica ultrapassa um limite.
+- **Target tracking**: mantém uma métrica perto de um valor alvo. O Elastigroup calcula quantas instâncias são necessárias e escala para cima ou para baixo, dentro do `min_size` e do `max_size`.
+- **Predictive autoscaling**: uma extensão do target tracking de CPU que usa machine learning para prever a carga e escalar com antecedência (não explorado neste laboratório).
+
+O arquivo [04-scaling.tfvars](./scenarios/04-scaling.tfvars) configura:
+
+```hcl
+elastigroup = {
+  enable_monitoring = true # métricas do CloudWatch a cada 1 minuto, em vez de 5
+  scaling_target = {
+    target   = 50 # CPU média do grupo em 50%
+    cooldown = 60 # segundos entre duas ações de escala
+  }
+}
+```
+
+A política é criada em [elastigroup.tf](./elastigroup.tf) com a métrica `CPUUtilization` do namespace `AWS/EC2`, na média de todas as instâncias do grupo.
+
+> O `enable_monitoring` liga o monitoramento detalhado do EC2, que tem um pequeno custo por instância. Sem ele, o CloudWatch recebe um ponto da métrica a cada 5 minutos, com alguns minutos de atraso, e a política tem poucos pontos para avaliar durante a carga.
+
+> **Atenção:** assim como a base On-Demand do [cenário 02](#explorando-os-mercados-spot-e-on-demand), o `enable_monitoring` é uma configuração de lançamento e vale somente para **novas instâncias**. As instâncias que já estão rodando continuam com o monitoramento básico (confira com `Monitoring.State = disabled` no `aws ec2 describe-instances`). Sem o Roll, a carga do próximo passo pode terminar sem que o Elastigroup escale.
+>
+> ![Gráfico de CPU do EC2 com um ponto a cada 5 minutos](./images/cpu_load.png)
+>
+> Na aba **Monitoring** do EC2, o gráfico de CPU de instâncias com o monitoramento básico tem um ponto a cada 5 minutos. Neste exemplo, a carga começou logo após as 14:00 (horário local), e a CPU chegou a 100% somente no ponto das 14:05. Os 10 minutos de carga terminaram sem nenhuma ação de escala no grupo.
+
+Aplique o cenário, inicie o Roll e espere ele terminar (`finished`) antes de gerar a carga:
+
+```bash
+terraform plan -out plan -var-file=scenarios/04-scaling.tfvars
+terraform apply plan
+mise run roll
+mise run roll-status
+```
+
+#### Validação
+
+1. **Gere carga**: a task `cpu-load` envia pelo SSM, para as instâncias do grupo, o script [cpu-load.json](./scripts/cpu-load.json), que ocupa 100% de todos os vCPUs por 15 minutos:
+
+   ```bash
+   mise run cpu-load
+   ```
+
+2. **Scale up**: com as 2 instâncias em 100%, a CPU média fica bem acima dos 50%. Depois de alguns minutos (o tempo de a métrica chegar ao CloudWatch e de a política avaliar), o Elastigroup lança novas instâncias, uma por vez, até o `max_size` de 4.
+
+   ```bash
+   mise run instances
+   ```
+
+   As instâncias novas não recebem a carga, já que o comando foi enviado somente para as que existiam. Por isso, a média do grupo cai a cada instância nova, e o grupo oscila perto do alvo: ele pode remover uma instância e subir outra enquanto a carga continua.
+
+3. **Scale down**: após os 15 minutos do script, a CPU cai, e o Elastigroup remove instâncias aos poucos até o `min_size` de 1. As instâncias removidas passam por `draining` no Target Group antes de serem encerradas.
+
+4. **Console**: as ações de escala aparecem na aba **Log**:
+
+   ![Scale ups, aviso de capacidade máxima e scale down na aba Log](./images/log_scaleup.png)
+
+   > Lendo de baixo para cima: 3 scale ups, com cerca de 1 minuto entre eles (o `cooldown` de 60 segundos), cada um com a instância nova registrada no Target Group. Em seguida, os avisos `Cannot scale up, The group is already at its maximum capacity` mostram que a política ainda queria mais instâncias, mas o grupo chegou ao `max_size`. Por fim, ainda durante a carga, um scale down remove uma das instâncias novas, já que elas não recebem carga e a média do grupo ficou abaixo do alvo. Os IDs e os horários serão os do seu ambiente.
+
+> O próximo apply, de qualquer cenário, volta o grupo para 2 instâncias (o `desired_capacity` do [variables.tf](./variables.tf)).
+
+> **Documentação do Elastigroup:** [Target scaling e Predictive Autoscaling](https://docs.flexera.com/spot/elastigroup/features/scaling/target-scaling) | [Simple scaling](https://docs.flexera.com/spot/elastigroup/features/scaling/simple-scaling-policies) | [Predictive Autoscaling](https://docs.flexera.com/spot/elastigroup/features/scaling/predictive-autoscaling)
+
+#### Custo x Benefício
+
+Um alvo de CPU baixo deixa mais folga para picos, mas mantém mais instâncias ligadas. Um alvo alto economiza, mas deixa a aplicação mais perto do limite enquanto as novas instâncias sobem. Como o Elastigroup usa Spot, escalar para cima custa bem menos do que em um ASG On-Demand, o que permite alvos mais conservadores.
 
 ## Limpeza
 

@@ -65,7 +65,7 @@ aws ssm send-command --document-name AWS-RunShellScript --instance-ids "$ID" \
 '''
 
 [tasks.cpu-load]
-description = "Keep every vCPU of the current instances at 100% for 10 minutes, through SSM"
+description = "Keep every vCPU of the current instances at 100% for 15 minutes, through SSM"
 run = '''
 aws ssm send-command --document-name AWS-RunShellScript \
   --targets "Key=tag:elastic-lab/group,Values=elastic-lab" \
